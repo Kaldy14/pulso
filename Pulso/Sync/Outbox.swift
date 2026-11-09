@@ -21,6 +21,11 @@ actor Outbox {
     private var failureCount = 0
     private var nextAttempt = Date.distantPast
     private var chain: Task<Void, Never>?
+    private var drainRequested = false
+    private var forceRequested = false
+    private var retryTask: Task<Void, Never>?
+    private let retryInterval: TimeInterval
+    private var deliveryError: String?
 
     init(
         directory: URL,
@@ -29,7 +34,8 @@ actor Outbox {
         target: @escaping @Sendable () -> (url: URL, token: String?)?,
         log: LogStore,
         status: AppStatus,
-        maxBatchBytes: Int = Wire.maxBatchBytes
+        maxBatchBytes: Int = Wire.maxBatchBytes,
+        retryInterval: TimeInterval = Outbox.baseRetryInterval
     ) {
         self.directory = directory
         self.anchors = anchors
@@ -38,6 +44,7 @@ actor Outbox {
         self.log = log
         self.status = status
         self.maxBatchBytes = maxBatchBytes
+        self.retryInterval = retryInterval
         sequence = UserDefaults.standard.integer(forKey: SettingsKeys.outboxSequence)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
@@ -62,25 +69,37 @@ actor Outbox {
             try data.write(to: directory.appendingPathComponent(name), options: .atomic)
         }
         // Pipeline uploads with whatever the caller does next.
-        Task { await self.drain(force: false) }
+        startDrain(force: false)
     }
 
     // MARK: - Drain
 
-    /// Serialized via task-chaining: concurrent calls queue up rather than
-    /// interleave, and every caller returns only after its own pass finished.
+    /// One worker services all producers. A large import used to create a
+    /// retained chain of thousands of tasks, each rescanning the same files.
     func drain(force: Bool) async {
-        let previous = chain
+        await startDrain(force: force).value
+    }
+
+    @discardableResult
+    func startDrain(force: Bool) -> Task<Void, Never> {
+        drainRequested = true
+        forceRequested = forceRequested || force
+        if let chain { return chain }
         let task = Task {
-            await previous?.value
-            await self.performDrain(force: force)
+            repeat {
+                let force = forceRequested
+                drainRequested = false
+                forceRequested = false
+                await performDrain(force: force)
+                await refreshPendingStatus()
+            } while drainRequested
+            chain = nil
         }
         chain = task
-        await task.value
+        return task
     }
 
     private func performDrain(force: Bool) async {
-        defer { Task { await self.refreshPendingStatus() } }
         var files = pendingFiles()
         guard !files.isEmpty else { return }
         guard let target = target() else {
@@ -112,8 +131,13 @@ actor Outbox {
                 try FileManager.default.removeItem(at: file)
                 failureCount = 0
                 nextAttempt = .distantPast
+                retryTask?.cancel()
+                retryTask = nil
                 let response = "HTTP \(result.status) · \(result.bodySnippet.prefix(80))"
                 await status.recordDelivery(typeKey: batch.typeKey, count: batch.sampleCount, response: response)
+                await status.clearError(ifMatching: deliveryError)
+                deliveryError = nil
+                await refreshPendingStatus()
                 await log.info(
                     "delivered \(batch.sampleCount) \(batch.typeKey) sample(s) — HTTP \(result.status) in \(Int(result.duration * 1000))ms"
                 )
@@ -125,13 +149,20 @@ actor Outbox {
     }
 
     private func recordFailure(_ reason: String, status statusCode: Int?) async {
+        deliveryError = reason
         await status.setError(reason)
         failureCount += 1
         let delay = min(
             Self.maxRetryInterval,
-            Self.baseRetryInterval * pow(2, Double(failureCount - 1))
+            retryInterval * pow(2, Double(failureCount - 1))
         )
         nextAttempt = Date(timeIntervalSinceNow: delay)
+        retryTask?.cancel()
+        retryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) }
+            catch { return }
+            await self?.drain(force: false)
+        }
         var hint = ""
         if statusCode == 401 { hint = " — check the X-Health-Key in Settings" }
         await status.setLastResponse(String(reason.prefix(160)))
@@ -149,12 +180,16 @@ actor Outbox {
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    /// Resume from the newest durably queued page after process death.
-    func queuedAnchor(for key: String) throws -> Data? {
-        var result: Data?
+    /// Restore the newest checkpoint for every type in one FIFO scan. This
+    /// keeps split pages safe: only their final file contains an anchor.
+    func queuedAnchors() throws -> [String: Data] {
+        var result: [String: Data] = [:]
         for file in pendingFiles() {
-            let batch = try Wire.fileDecoder().decode(Batch.self, from: Data(contentsOf: file))
-            if batch.typeKey == key, let anchor = batch.anchor { result = anchor }
+            try Task.checkCancellation()
+            try autoreleasepool {
+                let batch = try Wire.fileDecoder().decode(Batch.self, from: Data(contentsOf: file))
+                if let anchor = batch.anchor { result[batch.typeKey] = anchor }
+            }
         }
         return result
     }
@@ -169,6 +204,8 @@ actor Outbox {
     }
 
     func removeAll() async {
+        retryTask?.cancel()
+        retryTask = nil
         for file in pendingFiles() {
             try? FileManager.default.removeItem(at: file)
         }

@@ -250,8 +250,210 @@ final class OutboxTests: XCTestCase {
         try await outbox.enqueue(typeKey: "a", elements: [element("one")], anchor: anchor)
         await outbox.drain(force: false)
         let restored = makeOutbox()
-        let queued = try await restored.queuedAnchor(for: "a")
+        let queued = try await restored.queuedAnchors()["a"]
         XCTAssertEqual(queued, anchor)
         XCTAssertNil(anchorData("a"))
+    }
+    func testRestartRestoresLatestCheckpointForEveryTypeInOneSnapshot() async throws {
+        let outbox = makeOutbox(hasTarget: false)
+        try await outbox.enqueue(typeKey: "a", elements: [element("one")], anchor: Data("a1".utf8))
+        try await outbox.enqueue(typeKey: "b", elements: [element("two")], anchor: Data("b1".utf8))
+        try await outbox.enqueue(typeKey: "a", elements: [element("three")], anchor: Data("a2".utf8))
+        // A partial split page has no checkpoint yet and must not erase a2.
+        try await outbox.enqueue(typeKey: "a", elements: [element("four")], anchor: nil)
+        await outbox.drain(force: false)
+        let restored = makeOutbox(hasTarget: false)
+        let checkpoints = try await restored.queuedAnchors()
+        XCTAssertEqual(checkpoints, ["a": Data("a2".utf8), "b": Data("b1".utf8)])
+        XCTAssertNil(anchorData("a"), "reading a checkpoint must not acknowledge delivery")
+    }
+
+    func testCorruptQueueCannotBeUsedToAdvanceAnyType() async throws {
+        let outbox = makeOutbox(hasTarget: false)
+        try await outbox.enqueue(typeKey: "a", elements: [element("one")], anchor: Data("a1".utf8))
+        try Data("broken".utf8).write(to: outboxDir.appendingPathComponent("batch-999999999999-bad.json"))
+        do {
+            _ = try await outbox.queuedAnchors()
+            XCTFail("Corrupt queue must stop checkpoint restoration")
+        } catch { }
+        XCTAssertNil(anchorData("a"))
+    }
+
+    func testNetworkFailureRetriesWithoutAnotherHealthKitOrManualTrigger() async throws {
+        uploader.enqueueResult(.failure(URLError(.timedOut)))
+        let outbox = Outbox(
+            directory: outboxDir, anchors: anchors, uploader: uploader,
+            target: { (URL(string: "http://100.64.0.1/apple-health")!, "test") },
+            log: log, status: status, retryInterval: 0.05
+        )
+        try await outbox.enqueue(typeKey: "a", elements: [element("one")], anchor: Data("a1".utf8))
+        await outbox.drain(force: false)
+        for _ in 0..<200 {
+            if await outbox.pendingCount() == 0 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let pending = await outbox.pendingCount()
+        XCTAssertEqual(pending, 0)
+        XCTAssertEqual(uploader.callCount, 2)
+        XCTAssertNil(status.lastError, "a recovered delivery error must disappear")
+        XCTAssertEqual(uploader.call(0).body, uploader.call(1).body, "retry identity must remain stable")
+        XCTAssertEqual(anchorData("a"), Data("a1".utf8))
+    }
+
+    func testDeliveryRecoveryDoesNotHideUnrelatedHealthKitError() {
+        status.setError("HealthKit is locked")
+        status.clearError(ifMatching: "The request timed out.")
+        XCTAssertEqual(status.lastError, "HealthKit is locked")
+    }
+
+    func testConcurrentProducersUseOneUploaderAndDeliverNewPages() async throws {
+        let blocked = BlockingUploader()
+        let outbox = Outbox(
+            directory: outboxDir, anchors: anchors, uploader: blocked,
+            target: { (URL(string: "http://100.64.0.1/apple-health")!, "test") },
+            log: log, status: status
+        )
+        try await outbox.enqueue(typeKey: "a", elements: [element("first")], anchor: Data("a1".utf8))
+        await blocked.waitUntilStarted()
+        for i in 0..<100 {
+            try await outbox.enqueue(typeKey: "a", elements: [element("next-\(i)")], anchor: Data("a-\(i)".utf8))
+        }
+        await blocked.release()
+        await outbox.drain(force: false)
+        let counts = await blocked.counts()
+        let pending = await outbox.pendingCount()
+        XCTAssertEqual(counts.calls, 101)
+        XCTAssertEqual(counts.maximumInFlight, 1)
+        XCTAssertEqual(pending, 0)
+        XCTAssertEqual(anchorData("a"), Data("a-99".utf8))
+    }
+
+}
+
+
+private actor AsyncGate {
+    private var opened = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        opened = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+}
+
+private actor BlockingUploader: Uploading {
+    private let started = AsyncGate()
+    private let gate = AsyncGate()
+    private var callCount = 0
+    private var inFlight = 0
+    private var maximumInFlight = 0
+
+    func send(_ body: Data, gzipped: Bool, to url: URL, token: String?) async throws -> UploadResult {
+        callCount += 1
+        inFlight += 1
+        maximumInFlight = max(maximumInFlight, inFlight)
+        await started.open()
+        await gate.wait()
+        inFlight -= 1
+        return MockUploader.ok
+    }
+
+    func waitUntilStarted() async { await started.wait() }
+    func release() async { await gate.open() }
+    func counts() -> (calls: Int, maximumInFlight: Int) { (callCount, maximumInFlight) }
+}
+
+private actor SyncProbe {
+    let started = AsyncGate()
+    let gate = AsyncGate()
+    private(set) var cancellations: [Bool] = []
+    private(set) var reasons: [String] = []
+
+    func perform(_ reason: SyncReason) async {
+        reasons.append(reason.description)
+        await started.open()
+        await gate.wait()
+        cancellations.append(Task.isCancelled)
+    }
+}
+
+@MainActor
+final class SyncCoordinatorTests: XCTestCase {
+    private func waitForCallers(_ count: Int, in coordinator: SyncCoordinator) async throws {
+        for _ in 0..<200 {
+            if await coordinator.waitingCount == count { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Callers did not register")
+    }
+
+    func testExpiringObserverDoesNotCancelManualSync() async throws {
+        let coordinator = SyncCoordinator()
+        let probe = SyncProbe()
+        let observerReturned = expectation(description: "observer deadline returns promptly")
+        let observer = Task {
+            await coordinator.run(.observer("steps")) { await probe.perform($0) }
+            observerReturned.fulfill()
+        }
+        await probe.started.wait()
+        let foreground = Task {
+            await coordinator.run(.manual) { await probe.perform($0) }
+        }
+        try await waitForCallers(2, in: coordinator)
+        observer.cancel()
+        await fulfillment(of: [observerReturned], timeout: 1)
+        await probe.gate.open()
+        await foreground.value
+        let cancellations = await probe.cancellations
+        let reasons = await probe.reasons
+        XCTAssertEqual(cancellations, [false, false])
+        XCTAssertEqual(reasons, ["new steps data", "manual"])
+    }
+
+    func testForegroundRestartsAfterCancelledBackgroundRun() async throws {
+        let coordinator = SyncCoordinator()
+        let probe = SyncProbe()
+        let observerReturned = expectation(description: "cancelled waiter releases before work completes")
+        let observer = Task {
+            await coordinator.run(.observer("steps")) { await probe.perform($0) }
+            observerReturned.fulfill()
+        }
+        await probe.started.wait()
+        observer.cancel()
+        await fulfillment(of: [observerReturned], timeout: 1)
+        let foreground = Task {
+            await coordinator.run(.foreground) { await probe.perform($0) }
+        }
+        try await waitForCallers(1, in: coordinator)
+        await probe.gate.open()
+        await foreground.value
+        let cancellations = await probe.cancellations
+        XCTAssertEqual(cancellations, [true, false], "new caller must get an uncancelled run")
+    }
+
+    func testObserverBurstCoalescesAndKeepsManualRetryPriority() async throws {
+        let coordinator = SyncCoordinator()
+        let probe = SyncProbe()
+        let first = Task { await coordinator.run(.observer("first")) { await probe.perform($0) } }
+        await probe.started.wait()
+        let manual = Task { await coordinator.run(.manual) { await probe.perform($0) } }
+        try await waitForCallers(2, in: coordinator)
+        let observers = (0..<30).map { i in
+            Task { await coordinator.run(.observer("type-\(i)")) { await probe.perform($0) } }
+        }
+        try await waitForCallers(32, in: coordinator)
+        await probe.gate.open()
+        await first.value
+        await manual.value
+        for observer in observers { await observer.value }
+        let reasons = await probe.reasons
+        XCTAssertEqual(reasons, ["new first data", "manual"])
     }
 }

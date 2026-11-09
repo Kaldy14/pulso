@@ -1,6 +1,6 @@
 # Verification of the tailnet fork
 
-Verified on 2026-11-09 with Xcode 27.2:
+Initial installation verified on 2026-11-09 with Xcode 27.2:
 
 - Signed iOS device build succeeded with team Vosime.cz Holding s.r.o. (`7DTQ6967VA`) and the development identity associated with the configured `it@vosime.cz` account.
 - `codesign --verify --deep --strict` passed. The signed app contains HealthKit and HealthKit background-delivery entitlements.
@@ -20,3 +20,32 @@ Not verified:
 The Apple license agreement and initial device-registration blockers were resolved. The signing certificate was not revoked; the newly available matching local identity and Xcode-managed profile signed the app successfully.
 
 These are implementation, simulator and physical-installation checks, not real-health-data export acceptance or deployed-receiver proof.
+
+## Sync recovery fix (2026-11-09)
+
+Physical-device diagnostics found 1,035 pending files (118,576,238 bytes), no
+successful delivery in the retained log, and an upload timeout. The configured
+endpoint was the intended `/apple-health` URL. A HealthKit-triggered run was
+cancelled during the first history import.
+
+The old recovery code decoded the entire outbox once per enabled type. Recovery
+now restores every type's checkpoint in one scan, then starts uploading existing
+pages before querying more history. Upload triggers share one worker rather than
+a retained task chain. Failures schedule an actual retry while iOS allows the app
+to execute; a manual/foreground run bypasses backoff. Observer timeout cancellation
+releases only its own waiter and cannot cancel a waiting foreground import.
+Cancellation without remaining callers preserves queued pages for a fresh run.
+
+- 50 simulator tests passed, including automatic network retry, unchanged retry
+  body, FIFO delivery under concurrent producers, checkpoint restoration,
+  corruption blocking, observer cancellation and foreground restart.
+- Signed device build and strict codesign verification passed.
+- Updated the installed app in place. All 1,035 original queue files and their
+  total byte size were preserved; no re-import or app-data reset was performed.
+- No screen layout or permission flow changed. Physical screen recording and
+  before/after UI captures are unavailable because the device automation service
+  exposes only the simulator. Runtime verification on the phone requires the
+  user to reopen the app after installation.
+- The receiver was still unreachable from this Mac during the fix. An earlier
+  successful HEAD reported by the user is not proof of POST ingestion or UUID
+  deduplication. Actual delivery of the queued health history remains to verify.

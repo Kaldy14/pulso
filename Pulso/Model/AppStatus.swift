@@ -61,6 +61,11 @@ final class AppStatus {
 
     func setError(_ error: String?) { lastError = error }
 
+    func clearError(ifMatching recoveredError: String?) {
+        // A successful retry must not hide a separate HealthKit read error.
+        if let recoveredError, lastError == recoveredError { lastError = nil }
+    }
+
     func setLastResponse(_ response: String) {
         lastResponse = response
         save()

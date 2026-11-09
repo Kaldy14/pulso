@@ -10,6 +10,13 @@ enum SyncReason: CustomStringConvertible, Sendable {
     case settingsChanged
     case reimport
 
+    var forcesUpload: Bool {
+        switch self {
+        case .manual, .foreground, .settingsChanged, .reimport: true
+        case .observer, .backgroundRefresh: false
+        }
+    }
+
     var description: String {
         switch self {
         case .manual: "manual"
@@ -37,8 +44,7 @@ actor SyncEngine {
     private let log: LogStore
     private let status: AppStatus
     private var anchorCache: [String: HKQueryAnchor] = [:]
-    private var chain: Task<Void, Never>?
-    private var anotherPass = false
+    private let coordinator = SyncCoordinator()
 
     init(
         healthStore: HKHealthStore, anchors: AnchorStore, outbox: Outbox,
@@ -51,27 +57,12 @@ actor SyncEngine {
         self.status = status
     }
 
-    /// Every trigger funnels here. Passes are serialized; each caller returns
-    /// after its own pass (and the outbox drain it triggers) completes.
+    /// Callers share a run, but cancelling one observer must not cancel a
+    /// foreground caller that is still waiting for its import.
     func requestSync(_ reason: SyncReason) async {
-        if let chain {
-            anotherPass = true
-            await chain.value
-            return
+        await coordinator.run(reason) { reason in
+            await self.performSync(reason)
         }
-        let task = Task {
-            repeat {
-                self.anotherPass = false
-                await self.performSync(reason)
-            } while self.anotherPass && !Task.isCancelled
-        }
-        chain = task
-        await withTaskCancellationHandler {
-            await task.value
-        } onCancel: {
-            task.cancel()
-        }
-        chain = nil
     }
 
     private func performSync(_ reason: SyncReason) async {
@@ -84,17 +75,27 @@ actor SyncEngine {
         await status.setError(nil)
         let enabled = AppSettings.currentEnabledTypes()
 
-        // Resume from queued checkpoints before acknowledged disk anchors.
+        await log.info("sync started (\(reason))")
+
+        // Restore all types in ONE scan. A per-type scan decoded the entire
+        // history ~200 times, blocking both HealthKit queries and uploads.
+        let queuedAnchors: [String: Data]
+        do {
+            queuedAnchors = try await outbox.queuedAnchors()
+        } catch {
+            if !(error is CancellationError) {
+                await status.setError("Unreadable pending batch. Sync stopped to preserve data.")
+            }
+            await status.setSyncing(false)
+            return
+        }
+        // Existing durable pages can upload while new HealthKit pages are read.
+        let delivery = await outbox.startDrain(force: reason.forcesUpload)
         var resolvedAnchors: [String: HKQueryAnchor] = [:]
         for type in enabled {
-            let queuedData: Data?
-            do { queuedData = try await outbox.queuedAnchor(for: type.key) }
-            catch {
-                await status.setError("Unreadable pending batch. Sync stopped to preserve data.")
-                await status.setSyncing(false)
-                return
+            let queuedAnchor = queuedAnchors[type.key].flatMap {
+                try? NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: $0)
             }
-            let queuedAnchor = queuedData.flatMap { try? NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: $0) }
             if let anchor = anchorCache[type.key] ?? queuedAnchor ?? anchors.load(type.key) {
                 resolvedAnchors[type.key] = anchor
             }
@@ -105,7 +106,12 @@ actor SyncEngine {
         var anyFailed = false
         for type in enabled {
             do {
+                try Task.checkCancellation()
                 queued += try await sync(type, anchor: resolvedAnchors[type.key])
+            } catch is CancellationError {
+                anyFailed = true
+                await log.info("sync paused; queued data will resume on the next run")
+                break
             } catch {
                 anyFailed = true
                 await status.setError("\(type.displayName): \(error.localizedDescription)")
@@ -116,12 +122,10 @@ actor SyncEngine {
             UserDefaults.standard.set(false, forKey: SettingsKeys.reimportPending)
             await log.info("full re-import pass completed for all enabled types")
         }
-        let force: Bool
-        switch reason {
-        case .manual, .foreground, .settingsChanged, .reimport: force = true
-        case .observer, .backgroundRefresh: force = false
-        }
-        await outbox.drain(force: force)
+        await delivery.value
+        // The first drain may have finished while queries were still running.
+        // Do not force another retry here after an HTTP failure in this pass.
+        if !Task.isCancelled { await outbox.drain(force: false) }
         await status.setSyncing(false)
         if queued > 0 {
             await log.info("sync (\(reason)): queued \(queued) sample(s)")
@@ -193,5 +197,61 @@ actor SyncEngine {
 
     func resetAllAnchors() {
         anchorCache = [:]
+    }
+}
+
+/// Coalesces triggers and gives each caller a cancellable wait. In particular,
+/// the observer's 25-second deadline releases that observer promptly, without
+/// cancelling work needed by an open app. A new caller restarts a cancelled run.
+actor SyncCoordinator {
+    private var worker: Task<Void, Never>?
+    private var pendingReason: SyncReason?
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    var waitingCount: Int { waiters.count }
+
+    func run(_ reason: SyncReason, operation: @escaping @Sendable (SyncReason) async -> Void) async {
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume()
+                    return
+                }
+                waiters[id] = continuation
+                // Keep a manual retry's priority when observer events arrive.
+                if pendingReason?.forcesUpload != true { pendingReason = reason }
+                if worker == nil { start(operation) }
+            }
+        } onCancel: {
+            Task { await self.cancel(id) }
+        }
+    }
+
+    private func cancel(_ id: UUID) {
+        waiters.removeValue(forKey: id)?.resume()
+        if waiters.isEmpty {
+            pendingReason = nil
+            worker?.cancel()
+        }
+    }
+
+    private func start(_ operation: @escaping @Sendable (SyncReason) async -> Void) {
+        worker = Task {
+            while !Task.isCancelled, let reason = pendingReason {
+                pendingReason = nil
+                await operation(reason)
+            }
+            worker = nil
+            if pendingReason != nil, !waiters.isEmpty {
+                // A foreground request arrived after the old run was cancelled.
+                // It needs a fresh task, not the old task's cancellation flag.
+                start(operation)
+            } else {
+                let completed = waiters
+                waiters.removeAll()
+                for waiter in completed.values { waiter.resume() }
+            }
+        }
     }
 }
