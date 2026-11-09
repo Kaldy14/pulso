@@ -10,7 +10,7 @@ Verified on 2026-11-09 with Xcode 27.2:
 
 Not verified:
 
-- Signing with the requested Apple developer account: Xcode had zero configured Apple accounts; only an unrelated existing development certificate was present.
+- Signing with the requested Apple developer account: the account is now signed in and Vosime.cz Holding s.r.o. (7DTQ6967VA) is selected. Xcode reports “Unable to process request - PLA Update available”: the account holder must accept the latest Program License Agreement before Apple can issue the provisioning profile. The command-line build also fails to obtain a profile.
 - Installation and launch on the connected iPhone.
 - Before/after screenshots and a flow recording: the device automation service returned no devices even though Xcode's device inventory showed the connected phone and a simulator runtime was available. The unsigned upstream simulator build was preserved separately before UI edits, but captures could not be made.
 - Real permission grants, ECG/route/medication samples, background delivery after locking/unlocking, and end-to-end delivery to the user's receiver. No receiver URL or server deduplication contract has been supplied.
