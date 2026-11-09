@@ -15,6 +15,40 @@ final class AppStatus {
     var healthUnavailable = false
     var authNeeded = false
     var syncing = false
+    var preparingReimport = false
+    var reading = false
+    var uploading = false
+    var currentType = ""
+    var completedTypes = 0
+    var totalTypes = 0
+    var failedTypes = 0
+    var loadedSamples = 0
+    var outboxBytes: Int64 = 0
+    var passFinished = false
+
+    var deliveredSamples: Int { typeStatus.values.reduce(0) { $0 + $1.totalDelivered } }
+    var lastDelivered: Date? { typeStatus.values.compactMap(\.lastDelivered).max() }
+
+    func beginReading(total: Int) {
+        reading = true
+        passFinished = false
+        currentType = "Obnovujeme uložený průběh"
+        completedTypes = 0
+        failedTypes = 0
+        totalTypes = total
+        loadedSamples = 0
+    }
+    func readingType(_ name: String) { currentType = name }
+    func loaded(_ count: Int) { loadedSamples += count }
+    func finishedType(failed: Bool = false) {
+        if failed { failedTypes += 1 } else { completedTypes += 1 }
+    }
+    func endReading(completed: Bool) {
+        reading = false
+        passFinished = completed
+        currentType = completed ? "Načítání dokončeno" : "Načítání přerušeno"
+    }
+    func setUploading(_ value: Bool) { uploading = value }
     var needsInitialImport = false
     var typeStatus: [String: TypeStatus] = [:]
     var outboxPending = 0
@@ -71,8 +105,9 @@ final class AppStatus {
         save()
     }
 
-    func setOutbox(pending: Int, nextRetry: Date?) {
+    func setOutbox(pending: Int, nextRetry: Date?, bytes: Int64 = 0) {
         outboxPending = pending
+        outboxBytes = bytes
         outboxNextRetry = nextRetry
     }
 

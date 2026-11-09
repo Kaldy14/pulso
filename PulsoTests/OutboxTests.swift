@@ -306,6 +306,43 @@ final class OutboxTests: XCTestCase {
         XCTAssertEqual(status.lastError, "HealthKit is locked")
     }
 
+    func testReimportWaitsForInflightUploadBeforeResettingQueue() async throws {
+        let blocked = BlockingUploader()
+        let outbox = Outbox(directory: outboxDir, anchors: anchors, uploader: blocked,
+            target: { (URL(string: "http://100.64.0.1/apple-health")!, "test") }, log: log, status: status)
+        try await outbox.enqueue(typeKey: "a", elements: [element("old")], anchor: Data("old-anchor".utf8))
+        await blocked.waitUntilStarted()
+        let stopping = Task { await outbox.pause() }
+        // Give pause time to cancel the worker while the transport is blocked.
+        try await Task.sleep(for: .milliseconds(30))
+        await blocked.release()
+        await stopping.value
+        XCTAssertNil(anchorData("a"), "late response must not persist an old checkpoint after cancellation")
+        try await outbox.clearForReimport()
+        let pending = await outbox.pendingCount()
+        XCTAssertEqual(pending, 0)
+        await outbox.resume()
+        try await outbox.enqueue(typeKey: "a", elements: [element("new")], anchor: Data("new-anchor".utf8))
+        await outbox.drain(force: true)
+        XCTAssertEqual(anchorData("a"), Data("new-anchor".utf8))
+    }
+
+    func testProgressDoesNotClaimCompletionDuringReadingOrFailure() {
+        status.beginReading(total: 3)
+        status.readingType("Steps")
+        status.loaded(100)
+        status.finishedType()
+        status.finishedType(failed: true)
+        status.endReading(completed: false)
+        XCTAssertEqual(status.loadedSamples, 100)
+        XCTAssertEqual(status.completedTypes, 1)
+        XCTAssertEqual(status.failedTypes, 1)
+        XCTAssertFalse(status.passFinished)
+        status.beginReading(total: 3)
+        XCTAssertEqual(status.loadedSamples, 0)
+        XCTAssertEqual(status.failedTypes, 0)
+    }
+
     func testConcurrentProducersUseOneUploaderAndDeliverNewPages() async throws {
         let blocked = BlockingUploader()
         let outbox = Outbox(

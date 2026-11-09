@@ -26,6 +26,8 @@ actor Outbox {
     private var retryTask: Task<Void, Never>?
     private let retryInterval: TimeInterval
     private var deliveryError: String?
+    private var paused = false
+    private var queueSizes: [URL: Int64]?
 
     init(
         directory: URL,
@@ -66,7 +68,9 @@ actor Outbox {
             sequence += 1
             UserDefaults.standard.set(sequence, forKey: SettingsKeys.outboxSequence)
             let name = String(format: "batch-%012d-%@.json", sequence, String(batch.id.uuidString.prefix(8)))
-            try data.write(to: directory.appendingPathComponent(name), options: .atomic)
+            let file = directory.appendingPathComponent(name)
+            try data.write(to: file, options: .atomic)
+            queueSizes?[file] = Int64(data.count)
         }
         // Pipeline uploads with whatever the caller does next.
         startDrain(force: false)
@@ -82,6 +86,7 @@ actor Outbox {
 
     @discardableResult
     func startDrain(force: Bool) -> Task<Void, Never> {
+        guard !paused else { return Task {} }
         drainRequested = true
         forceRequested = forceRequested || force
         if let chain { return chain }
@@ -92,7 +97,7 @@ actor Outbox {
                 forceRequested = false
                 await performDrain(force: force)
                 await refreshPendingStatus()
-            } while drainRequested
+            } while drainRequested && !Task.isCancelled && !paused
             chain = nil
         }
         chain = task
@@ -120,7 +125,10 @@ actor Outbox {
             }
             do {
                 let body = try HealthAutoExport.encode(batch.elements)
+                await status.setUploading(true)
                 let result = try await uploader.send(body, gzipped: false, to: target.url, token: target.token)
+                await status.setUploading(false)
+                try Task.checkCancellation()
                 guard result.isSuccess else {
                     await recordFailure("HTTP \(result.status) \(result.bodySnippet.prefix(120))", status: result.status)
                     return
@@ -129,6 +137,7 @@ actor Outbox {
                     anchors.saveRaw(anchorData, for: batch.typeKey)
                 }
                 try FileManager.default.removeItem(at: file)
+                queueSizes?.removeValue(forKey: file)
                 failureCount = 0
                 nextAttempt = .distantPast
                 retryTask?.cancel()
@@ -142,6 +151,8 @@ actor Outbox {
                     "delivered \(batch.sampleCount) \(batch.typeKey) sample(s) — HTTP \(result.status) in \(Int(result.duration * 1000))ms"
                 )
             } catch {
+                await status.setUploading(false)
+                if Task.isCancelled { return }
                 await recordFailure(error.localizedDescription, status: nil)
                 return
             }
@@ -199,8 +210,33 @@ actor Outbox {
     }
 
     func refreshPendingStatus() async {
-        let count = pendingFiles().count
-        await status.setOutbox(pending: count, nextRetry: failureCount > 0 && count > 0 ? nextAttempt : nil)
+        if queueSizes == nil {
+            queueSizes = Dictionary(uniqueKeysWithValues: pendingFiles().map { file in
+                (file, Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0))
+            })
+        }
+        let count = queueSizes?.count ?? 0
+        let bytes = queueSizes?.values.reduce(0, +) ?? 0
+        await status.setOutbox(pending: count, nextRetry: failureCount > 0 && count > 0 ? nextAttempt : nil, bytes: bytes)
+    }
+
+    func pause() async {
+        paused = true
+        retryTask?.cancel()
+        retryTask = nil
+        drainRequested = false
+        chain?.cancel()
+        await chain?.value
+    }
+
+    func resume() { paused = false }
+
+    func clearForReimport() async throws {
+        for file in pendingFiles() { try FileManager.default.removeItem(at: file) }
+        queueSizes = nil
+        failureCount = 0
+        nextAttempt = .distantPast
+        await refreshPendingStatus()
     }
 
     func removeAll() async {
@@ -209,6 +245,7 @@ actor Outbox {
         for file in pendingFiles() {
             try? FileManager.default.removeItem(at: file)
         }
+        queueSizes = nil
         failureCount = 0
         nextAttempt = .distantPast
         await refreshPendingStatus()

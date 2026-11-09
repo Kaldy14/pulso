@@ -57,15 +57,16 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Button("Re-import Full History", role: .destructive) {
+                    Button("Znovu odeslat celou historii", role: .destructive) {
                         confirmReimport = true
                     }
-                    .confirmationDialog("Re-import everything?", isPresented: $confirmReimport) {
-                        Button("Re-import", role: .destructive) {
+                    .disabled(services.status.preparingReimport)
+                    .confirmationDialog("Znovu odeslat celou historii?", isPresented: $confirmReimport) {
+                        Button("Spustit úplný import", role: .destructive) {
                             Task { await services.reimportAll() }
                         }
                     } message: {
-                        Text("Clears local sync state and sends your entire history again. Your server deduplicates by sample ID, so this is safe — just slow.")
+                        Text("Zastaví současný běh a znovu načte dostupnou historii povolených typů. Server musí slučovat opakované záznamy podle jejich ID.")
                     }
                 } header: {
                     Text("Maintenance")

@@ -49,3 +49,25 @@ Cancellation without remaining callers preserves queued pages for a fresh run.
 - The receiver was still unreachable from this Mac during the fix. An earlier
   successful HEAD reported by the user is not proof of POST ingestion or UUID
   deduplication. Actual delivery of the queued health history remains to verify.
+
+## Progress screen A and safe full-history restart (2026-11-09)
+
+- Approved variant A implemented with separate HealthKit reading and server
+  delivery sections. Type completion, current type, records read this pass,
+  lifetime acknowledgments since reset, queued batches/bytes, retry time and
+  last acknowledgment use actual engine/outbox events. There is no invented
+  percentage of all health records. Server acknowledgment is explicitly distinct
+  from downstream forwarding.
+- Full re-import suspends new sync triggers, cancels and joins the current
+  reader/uploader, then resets the queue and anchors before resuming. A durable
+  preparation flag makes interrupted preparation repeat on next app launch.
+- Manual upload retry is independent of history reading. Queue sizes are cached
+  and updated on disk mutations rather than statting every file per update.
+- 52 simulator tests passed. Added a blocked-upload regression proving an old
+  acknowledgment cannot advance anchors after cancellation/reset, and progress
+  tests distinguishing failed types from successful completion.
+- Signed device and simulator builds succeeded. The update was installed over
+  the existing physical app without uninstalling or initiating re-import.
+- Simulator before/after captures and a recording of the confirmation flow are
+  supplied in the conversation. Simulator counters include synthetic unit-test
+  data; these captures do not demonstrate a real health-history upload.

@@ -17,10 +17,10 @@ struct RootView: View {
         } else {
             TabView(selection: $tab) {
                 StatusView(services: services)
-                    .tabItem { Label("Status", systemImage: "waveform.path.ecg") }
+                    .tabItem { Label("Průběh", systemImage: "waveform.path.ecg") }
                     .tag(0)
                 SettingsView(services: services)
-                    .tabItem { Label("Settings", systemImage: "gearshape") }
+                    .tabItem { Label("Nastavení", systemImage: "gearshape") }
                     .tag(1)
             }
         }

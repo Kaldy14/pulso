@@ -45,6 +45,7 @@ actor SyncEngine {
     private let status: AppStatus
     private var anchorCache: [String: HKQueryAnchor] = [:]
     private let coordinator = SyncCoordinator()
+    private var paused = false
 
     init(
         healthStore: HKHealthStore, anchors: AnchorStore, outbox: Outbox,
@@ -60,6 +61,7 @@ actor SyncEngine {
     /// Callers share a run, but cancelling one observer must not cancel a
     /// foreground caller that is still waiting for its import.
     func requestSync(_ reason: SyncReason) async {
+        guard !paused, !UserDefaults.standard.bool(forKey: "sync.reimportPreparing") else { return }
         await coordinator.run(reason) { reason in
             await self.performSync(reason)
         }
@@ -74,6 +76,7 @@ actor SyncEngine {
         await status.setSyncing(true)
         await status.setError(nil)
         let enabled = AppSettings.currentEnabledTypes()
+        await status.beginReading(total: enabled.count)
 
         await log.info("sync started (\(reason))")
 
@@ -86,6 +89,7 @@ actor SyncEngine {
             if !(error is CancellationError) {
                 await status.setError("Unreadable pending batch. Sync stopped to preserve data.")
             }
+            await status.endReading(completed: false)
             await status.setSyncing(false)
             return
         }
@@ -107,13 +111,16 @@ actor SyncEngine {
         for type in enabled {
             do {
                 try Task.checkCancellation()
+                await status.readingType(type.displayName)
                 queued += try await sync(type, anchor: resolvedAnchors[type.key])
+                await status.finishedType()
             } catch is CancellationError {
                 anyFailed = true
                 await log.info("sync paused; queued data will resume on the next run")
                 break
             } catch {
                 anyFailed = true
+                await status.finishedType(failed: true)
                 await status.setError("\(type.displayName): \(error.localizedDescription)")
                 await log.error("\(type.key): \(error.localizedDescription)")
             }
@@ -122,6 +129,7 @@ actor SyncEngine {
             UserDefaults.standard.set(false, forKey: SettingsKeys.reimportPending)
             await log.info("full re-import pass completed for all enabled types")
         }
+        await status.endReading(completed: !anyFailed && !Task.isCancelled)
         await delivery.value
         // The first drain may have finished while queries were still running.
         // Do not force another retry here after an HTTP failure in this pass.
@@ -177,6 +185,7 @@ actor SyncEngine {
                 anchor = newAnchor
             }
             queued += dtos.count
+            await status.loaded(dtos.count)
             await status.recordChecked(type.key)
             if !deleted.isEmpty {
                 await log.info("\(type.key): queued \(dtos.count) sample(s) + \(deleted.count) deletion(s)")
@@ -195,8 +204,21 @@ actor SyncEngine {
         anchor
     }
 
-    func resetAllAnchors() {
+    func prepareReimport() async throws {
+        paused = true
+        let worker = await coordinator.suspend()
+        await outbox.pause()
+        await worker?.value
+        // Nothing can write old anchors or enqueue pages beyond this barrier.
+        try await outbox.clearForReimport()
+        anchors.clearAll()
         anchorCache = [:]
+    }
+
+    func resumeAfterReimport() async {
+        await coordinator.resume()
+        await outbox.resume()
+        paused = false
     }
 }
 
@@ -205,12 +227,14 @@ actor SyncEngine {
 /// cancelling work needed by an open app. A new caller restarts a cancelled run.
 actor SyncCoordinator {
     private var worker: Task<Void, Never>?
+    private var suspended = false
     private var pendingReason: SyncReason?
     private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     var waitingCount: Int { waiters.count }
 
     func run(_ reason: SyncReason, operation: @escaping @Sendable (SyncReason) async -> Void) async {
+        guard !suspended else { return }
         let id = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -227,6 +251,15 @@ actor SyncCoordinator {
             Task { await self.cancel(id) }
         }
     }
+
+    func suspend() -> Task<Void, Never>? {
+        suspended = true
+        pendingReason = nil
+        worker?.cancel()
+        return worker
+    }
+
+    func resume() { suspended = false }
 
     private func cancel(_ id: UUID) {
         waiters.removeValue(forKey: id)?.resume()

@@ -2,143 +2,110 @@ import SwiftUI
 
 struct StatusView: View {
     let services: AppServices
-
+    @State private var confirmReimport = false
     private var status: AppStatus { services.status }
 
     var body: some View {
         NavigationStack {
             List {
-                Section("Synchronizace") {
-                    if let last = status.typeStatus.values.compactMap(\.lastDelivered).max() {
-                        LabeledContent("Poslední odeslání") { Text(last, format: .dateTime) }
-                    } else {
-                        Text("Data zatím nebyla odeslána")
+                Section {
+                    Label(headline, systemImage: status.preparingReimport ? "pause.circle" : "arrow.triangle.2.circlepath")
+                        .font(.headline)
+                    if let error = status.lastError {
+                        Text(error).font(.footnote).foregroundStyle(.red)
                     }
-                    if let error = status.lastError { Text(error).foregroundStyle(.red) }
-                    if let response = status.lastResponse { Text(response).font(.caption) }
-                    Text("Po odemčení synchronizujeme, jakmile iOS dovolí aplikaci běžet.")
-                        .font(.caption).foregroundStyle(.secondary)
                 }
-                if #available(iOS 26.0, *) {
-                    Section {
-                        Button("Povolit přístup k lékům") {
-                            Task { await services.requestMedicationAccess() }
-                        }
-                    } footer: {
-                        Text("Léky vybíráš jednotlivě v samostatném systémovém dialogu.")
+                Section {
+                    Text(status.currentType.isEmpty ? "Čekáme na synchronizaci" : status.currentType)
+                        .font(.headline)
+                    if status.totalTypes > 0 {
+                        ProgressView(value: Double(status.completedTypes), total: Double(status.totalTypes))
+                            .tint(.orange)
+                        LabeledContent("Dokončené typy", value: "\(status.completedTypes) / \(status.totalTypes)")
                     }
+                    LabeledContent("Načteno v tomto průchodu", value: status.loadedSamples.formatted())
+                    if status.failedTypes > 0 {
+                        LabeledContent("Typy s chybou", value: "\(status.failedTypes)").foregroundStyle(.red)
+                    }
+                } header: { Text("Načítání ze Zdraví") } footer: {
+                    Text("Celkový počet záznamů předem neznáme. Průběh ukazuje dokončené datové typy, nikoli procento všech dat.")
+                }
+                Section {
+                    Text(status.deliveredSamples.formatted())
+                        .font(.system(.title, design: .rounded).weight(.semibold))
+                    Text("Potvrzených záznamů od posledního úplného restartu")
+                        .font(.caption).foregroundStyle(.secondary)
+                    LabeledContent("Čeká v telefonu", value: "\(status.outboxPending.formatted()) dávek · \(ByteCountFormatter.string(fromByteCount: status.outboxBytes, countStyle: .file))")
+                    if status.uploading { Label("Odesíláme dávku…", systemImage: "arrow.up.circle") }
+                    if let date = status.lastDelivered {
+                        LabeledContent("Poslední potvrzení") { Text(date, style: .relative) }
+                    }
+                    if let retry = status.outboxNextRetry {
+                        LabeledContent("Další pokus nejdříve") { Text(retry, style: .time) }
+                    }
+                    Button("Zkusit odeslat teď") {
+                        Task { await services.retryDelivery() }
+                    }
+                    .disabled(status.preparingReimport || status.uploading || status.outboxPending == 0)
+                } header: { Text("Odesílání na nastavený server") } footer: {
+                    Text("Potvrzení znamená uložení na nastaveném serveru. Následné předání dalšímu serveru aplikace nevidí.")
+                }
+                Section {
+                    Button(status.syncing ? "Načítání probíhá…" : "Načíst nové údaje") {
+                        Task { await services.syncNow(.manual) }
+                    }
+                    .disabled(status.syncing || status.preparingReimport)
+                    NavigationLink("Detail průběhu") {
+                        List {
+                            ForEach(TypeRegistry.groups, id: \.self) { group in
+                                Section(group) {
+                                    ForEach(TypeRegistry.all.filter { $0.group == group && services.settings.isEnabled($0.key) }) { type in
+                                        VStack(alignment: .leading) {
+                                            Text(type.displayName)
+                                            Text("\(status.typeStatus[type.key]?.totalDelivered ?? 0) potvrzených záznamů")
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+                        }.navigationTitle("Datové typy")
+                    }
+                    NavigationLink("Záznam aktivity") { LogView(services: services) }
+                    Button("Znovu odeslat celou historii…", role: .destructive) { confirmReimport = true }
+                        .disabled(status.preparingReimport)
+                        .confirmationDialog("Znovu odeslat celou historii?", isPresented: $confirmReimport) {
+                            Button("Spustit úplný import", role: .destructive) {
+                                Task { await services.reimportAll() }
+                            }
+                        } message: {
+                            Text("Zastavíme současný běh a znovu načteme dostupnou historii povolených typů ze Zdraví. Server musí slučovat opakované záznamy podle jejich ID.")
+                        }
+                } footer: {
+                    Text("Při prvním nebo úplném importu nech aplikaci otevřenou. Načítání a odesílání probíhají současně; dokončeno je až po načtení typů a vyprázdnění fronty.")
                 }
                 if status.authNeeded {
                     Section {
-                        Button {
-                            Task { await services.requestHealthAccess() }
-                        } label: {
-                            Label("Grant Health Access", systemImage: "heart.text.square")
-                                .font(.headline)
-                        }
-                    } footer: {
-                        Text("Pulso only asks to read the types listed below. iOS never reveals what you granted — only your data (or its absence) does.")
+                        Button("Povolit přístup ke Zdraví") { Task { await services.requestHealthAccess() } }
                     }
                 }
-
-                if services.settings.baseURL == nil {
+                if #available(iOS 26.0, *) {
                     Section {
-                        Label("Set your server address in Settings", systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.orange)
+                        Button("Povolit přístup k lékům") { Task { await services.requestMedicationAccess() } }
                     }
                 }
-
-                Section {
-                    Button {
-                        Task { await services.syncNow(.manual) }
-                    } label: {
-                        HStack {
-                            if status.syncing {
-                                Image(systemName: "arrow.triangle.2.circlepath")
-                                    .padding(.trailing, 4)
-                            } else {
-                                Image(systemName: "arrow.triangle.2.circlepath")
-                            }
-                            Text(status.syncing ? "Syncing…" : "Sync Now")
-                                .font(.headline)
-                        }
-                    }
-                    .disabled(status.syncing)
-                } footer: {
-                    if status.needsInitialImport {
-                        Text("First sync imports your full history. Keep the app open and unlocked until it finishes — progress is saved continuously, so interrupting is safe.")
-                    }
-                }
-
-                ForEach(TypeRegistry.groups, id: \.self) { group in
-                    let types = enabledTypes.filter { $0.group == group }
-                    if !types.isEmpty {
-                        Section(group) {
-                            ForEach(types) { type in
-                                typeRow(type)
-                            }
-                        }
-                    }
-                }
-
-                Section("Delivery") {
-                    LabeledContent("Pending batches", value: "\(status.outboxPending)")
-                    if let retry = status.outboxNextRetry, retry > Date() {
-                        LabeledContent("Next retry") {
-                            Text(retry, style: .relative)
-                        }
-                    }
-                    if let response = status.lastResponse {
-                        LabeledContent("Last server response") {
-                            Text(response)
-                                .font(.caption)
-                                .lineLimit(2)
-                                .multilineTextAlignment(.trailing)
-                        }
-                    }
-                }
-
-                Section {
-                    NavigationLink("Activity Log") {
-                        LogView(services: services)
-                    }
+                if services.settings.baseURL == nil {
+                    Section { Text("V Nastavení zadej adresu serveru a klíč.").foregroundStyle(.orange) }
                 }
             }
             .navigationTitle("Pulso")
-            .refreshable {
-                await services.syncNow(.manual)
-            }
         }
     }
 
-    private var enabledTypes: [SyncedType] {
-        TypeRegistry.all.filter { services.settings.isEnabled($0.key) }
-    }
-
-    @ViewBuilder
-    private func typeRow(_ type: SyncedType) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(type.displayName)
-            Group {
-                if let ts = status.typeStatus[type.key], ts.totalDelivered > 0 {
-                    HStack(spacing: 4) {
-                        Text("\(ts.totalDelivered) delivered")
-                        if let checked = ts.lastChecked {
-                            Text("· checked")
-                            Text(checked, style: .relative)
-                            Text("ago")
-                        }
-                    }
-                } else if status.typeStatus[type.key]?.lastChecked != nil {
-                    // F1: HealthKit won't say whether read access was denied —
-                    // "no data" and "no permission" look identical.
-                    Text("No data yet — or Health access not granted (Health app → Sharing)")
-                } else {
-                    Text("Waiting for first sync")
-                }
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
+    private var headline: String {
+        if status.preparingReimport { return "Připravujeme úplný restart…" }
+        if status.reading { return "Načítáme historii" }
+        if status.outboxPending > 0 { return status.uploading ? "Odesíláme uložená data" : "Data čekají na odeslání" }
+        if status.passFinished && status.failedTypes == 0 { return "Synchronizace dokončena" }
+        return "Synchronizace připravena"
     }
 }

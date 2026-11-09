@@ -69,6 +69,9 @@ final class AppServices {
         hub.registerBackgroundRefresh()
         hub.scheduleNextRefresh()
         Task {
+            if UserDefaults.standard.bool(forKey: "sync.reimportPreparing") {
+                await reimportAll()
+            }
             await hub.startObservers()
             await refreshAuthStatus()
             await refreshDerived()
@@ -150,14 +153,35 @@ final class AppServices {
     /// Clears all sync state and re-sends everything. Safe (the server
     /// dedupes by uuid) but slow — guarded by a confirmation in Settings.
     func reimportAll() async {
-        // Persist the unfinished-import indicator before clearing checkpoints.
+        guard !status.preparingReimport else { return }
+        guard settings.baseURL != nil, !settings.token.isEmpty else {
+            status.setError("Nejdřív nastav adresu serveru a klíč.")
+            return
+        }
+        status.preparingReimport = true
+        UserDefaults.standard.set(true, forKey: "sync.reimportPreparing")
         UserDefaults.standard.set(true, forKey: SettingsKeys.reimportPending)
-        await log.warn("full re-import requested — clearing anchors and outbox")
-        await outbox.removeAll()
-        anchors.clearAll()
-        await engine.resetAllAnchors()
-        status.resetCounters()
+        await log.warn("full re-import requested; stopping previous run")
+        do {
+            try await engine.prepareReimport()
+            status.resetCounters()
+            UserDefaults.standard.set(false, forKey: "sync.reimportPreparing")
+            status.setError(nil)
+            await log.info("full re-import ready; starting history from the beginning")
+        } catch {
+            status.setError("Úplný import se nepodařilo připravit: \(error.localizedDescription)")
+            await engine.resumeAfterReimport()
+            status.preparingReimport = false
+            return
+        }
+        await engine.resumeAfterReimport()
+        status.preparingReimport = false
         await syncNow(.reimport)
+    }
+
+    func retryDelivery() async {
+        guard !status.preparingReimport else { return }
+        await outbox.drain(force: true)
     }
 
     func testConnection() async -> String {
