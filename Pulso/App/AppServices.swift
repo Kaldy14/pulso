@@ -108,6 +108,18 @@ final class AppServices {
         await syncNow(.manual)
     }
 
+    @available(iOS 26.0, *)
+    func requestMedicationAccess() async {
+        do {
+            // Authorizing a medication also authorizes its dose events.
+            try await healthStore.requestPerObjectReadAuthorization(for: HKObjectType.userAnnotatedMedicationType(), predicate: nil)
+            await syncNow(.manual)
+        } catch {
+            status.setError(error.localizedDescription)
+            await log.error("medication authorization failed: \(error.localizedDescription)")
+        }
+    }
+
     func refreshAuthStatus() async {
         guard !status.healthUnavailable else { return }
         do {

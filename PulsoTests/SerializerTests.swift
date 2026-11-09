@@ -295,4 +295,13 @@ final class SerializerTests: XCTestCase {
         }
         XCTAssertFalse(TypeRegistry.readTypes.contains { $0 is HKCorrelationType })
     }
+    func testOrdinaryAuthorizationExcludesPerObjectTypes() {
+        XCTAssertFalse(TypeRegistry.readTypes.contains { $0.requiresPerObjectAuthorization() })
+        if #available(iOS 26.0, *) {
+            XCTAssertNotNil(TypeRegistry.type(for: "medicationDoseEvent"), "Dose events must remain syncable")
+            XCTAssertFalse(TypeRegistry.readTypes.contains(HKObjectType.medicationDoseEventType()))
+            XCTAssertFalse(TypeRegistry.readTypes.contains(HKObjectType.userAnnotatedMedicationType()))
+        }
+    }
+
 }

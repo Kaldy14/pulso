@@ -8,7 +8,7 @@ Open `Pulso.xcodeproj` in Xcode 26+ (built here with Xcode 27.2). Select the dev
 
 Settings accepts the **complete POST URL**, including path, and a required `X-Health-Key` stored in the device-only Keychain. Use a Tailscale IPv4 address (`100.64.0.0/10`), Tailscale IPv6 address, or a `.ts.net` hostname. Tailscale must be connected on the phone. HTTPS is recommended; HTTP is supported inside the encrypted tailnet. Redirects are always refused. Test Connection issues HEAD to that exact URL; a receiver that only implements POST may return 405.
 
-Grant Health Access, then Sync Now. The first import includes the complete accessible history. Keep the phone unlocked and app open for that import. The Status tab shows last successful delivery, pending batches and errors.
+Grant Health Access, then Sync Now. On iOS 26+, use “Povolit přístup k lékům” separately to select medications; their dose events inherit that permission. The first import includes the complete accessible history. Keep the phone unlocked and app open for that import. The Status tab shows last successful delivery, pending batches and errors.
 
 ## Coverage and platform limits
 

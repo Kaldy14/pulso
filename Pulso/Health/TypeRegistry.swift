@@ -277,10 +277,15 @@ enum TypeRegistry {
     }
 
     static var readTypes: Set<HKObjectType> {
-        // Correlations inherit authorization from their member quantities.
-        var result = Set(all.filter { !($0.sampleType is HKCorrelationType) }.map { $0.sampleType as HKObjectType })
-        if #available(iOS 26.0, *) { result.insert(HKObjectType.userAnnotatedMedicationType()) }
-        return result
+        // Correlations inherit member permissions. Per-object types (medications)
+        // must never enter the ordinary authorization/status APIs: HealthKit throws
+        // an Objective-C exception rather than a catchable Swift error.
+        Set(all.filter {
+            // Dose events inherit medication permissions but report false for
+            // requiresPerObjectAuthorization(), so exclude them explicitly too.
+            $0.key != "medicationDoseEvent" && !($0.sampleType is HKCorrelationType)
+                && !$0.sampleType.requiresPerObjectAuthorization()
+        }.map { $0.sampleType as HKObjectType })
     }
 }
 private enum UIDeviceVersion {

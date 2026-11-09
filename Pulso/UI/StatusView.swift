@@ -19,6 +19,15 @@ struct StatusView: View {
                     Text("Po odemčení synchronizujeme, jakmile iOS dovolí aplikaci běžet.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                if #available(iOS 26.0, *) {
+                    Section {
+                        Button("Povolit přístup k lékům") {
+                            Task { await services.requestMedicationAccess() }
+                        }
+                    } footer: {
+                        Text("Léky vybíráš jednotlivě v samostatném systémovém dialogu.")
+                    }
+                }
                 if status.authNeeded {
                     Section {
                         Button {
