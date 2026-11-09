@@ -132,10 +132,8 @@ final class OutboxTests: XCTestCase {
         XCTAssertEqual(anchorData("b"), anchorB1)
 
         // FIFO: bodies arrive in enqueue order.
-        let firstBody = TestSupport.gunzip(uploader.call(0).body, expectedSize: 1 << 20)
-        let decoded = try JSONDecoder().decode([BatchElement].self, from: firstBody)
-        guard case .sample(let dto) = decoded[0] else { return XCTFail("expected a sample") }
-        XCTAssertTrue(dto.uuid.hasPrefix("first"))
+        let firstBody = String(decoding: uploader.call(0).body, as: UTF8.self)
+        XCTAssertTrue(firstBody.contains("first"))
         XCTAssertEqual(uploader.call(0).token, "tok")
         XCTAssertEqual(uploader.call(0).url.path, "/ingest")
     }
@@ -177,7 +175,7 @@ final class OutboxTests: XCTestCase {
         XCTAssertNil(anchorData("a"))
     }
 
-    func testCorruptBatchFileIsQuarantinedNotRetriedForever() async throws {
+    func testCorruptBatchStopsDeliveryWithoutDroppingData() async throws {
         let outbox = makeOutbox()
         try FileManager.default.createDirectory(at: outboxDir, withIntermediateDirectories: true)
         try Data("this is not json".utf8)
@@ -187,9 +185,9 @@ final class OutboxTests: XCTestCase {
 
         XCTAssertEqual(uploader.callCount, 0)
         let pending = await outbox.pendingCount()
-        XCTAssertEqual(pending, 0)
+        XCTAssertEqual(pending, 1)
         let names = try FileManager.default.contentsOfDirectory(atPath: outboxDir.path)
-        XCTAssertEqual(names, ["batch-000000000001-dead.json.corrupt"])
+        XCTAssertEqual(names, ["batch-000000000001-dead.json"])
     }
 
     func testOversizedEnqueueSplitsAndOnlyLastSliceCarriesAnchor() async throws {
@@ -234,19 +232,26 @@ final class OutboxTests: XCTestCase {
         XCTAssertEqual(pending, 0)
     }
 
-    func testUploadBodyIsGzippedWireFormat() async throws {
+    func testUploadBodyHasHealthAutoExportEnvelopeAndDeletions() async throws {
         let outbox = makeOutbox()
-        let elements: [BatchElement] = [element("one"), .tombstone(["gone-1", "gone-2"])]
-        try await outbox.enqueue(typeKey: "a", elements: elements, anchor: nil)
+        try await outbox.enqueue(typeKey: "a", elements: [element("one"), .tombstone(["gone-1"])], anchor: nil)
         await outbox.drain(force: true)
+        let root = try JSONDecoder().decode([String: JSONValue].self, from: uploader.call(0).body)
+        guard case .object(let data) = root["data"] else { return XCTFail("missing data envelope") }
+        XCTAssertEqual(data["deleted"], .array([.string("gone-1")]))
+        guard case .array(let metrics) = data["metrics"] else { return XCTFail("missing metrics") }
+        XCTAssertEqual(metrics.count, 1)
+    }
 
-        XCTAssertEqual(uploader.callCount, 1)
-        let body = uploader.call(0).body
-        XCTAssertEqual(Array(body.prefix(2)), [0x1f, 0x8b], "body must be gzipped")
-        let decoded = try JSONDecoder().decode(
-            [BatchElement].self,
-            from: TestSupport.gunzip(body, expectedSize: 1 << 20)
-        )
-        XCTAssertEqual(decoded, elements)
+    func testFailedDeliveryKeepsQueuedAnchorForRestart() async throws {
+        uploader.enqueueResult(.failure(URLError(.notConnectedToInternet)))
+        let outbox = makeOutbox()
+        let anchor = Data("resume-anchor".utf8)
+        try await outbox.enqueue(typeKey: "a", elements: [element("one")], anchor: anchor)
+        await outbox.drain(force: false)
+        let restored = makeOutbox()
+        let queued = try await restored.queuedAnchor(for: "a")
+        XCTAssertEqual(queued, anchor)
+        XCTAssertNil(anchorData("a"))
     }
 }

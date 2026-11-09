@@ -126,48 +126,39 @@ final class WireFormatTests: XCTestCase {
         XCTAssertEqual(slices, [elements])
     }
 
-    func testCatchUpCutoffs() {
-        // Fixed clock: one day after the newest legitimate timestamp.
-        let now = Date(timeIntervalSince1970: 1_784_102_580 + 86_400)
-        let latest = [
-            "sleepAnalysis": "2026-07-15T09:03:00+01:00",
-            "heartRate": "2026-07-15T05:00:00-04:00",
-            "fractional": "2026-07-15T09:03:00.500+01:00",
-            "futureDated": "2028-01-01T00:00:00Z",
-            "broken": "not a date",
-        ]
-        let cutoffs = CatchUp.cutoffs(fromLatest: latest, now: now)
-        // 72h margin, computed in absolute time: 09:03+01:00 == 08:03Z.
-        XCTAssertEqual(
-            cutoffs["sleepAnalysis"],
-            Date(timeIntervalSince1970: 1_784_102_580 - 72 * 3600)
-        )
-        XCTAssertEqual(cutoffs.count, 4, "unparseable timestamps are dropped, not fatal")
-        XCTAssertNil(cutoffs["broken"])
-        let sleep = cutoffs["sleepAnalysis"]!, heart = cutoffs["heartRate"]!
-        XCTAssertEqual(heart.timeIntervalSince(sleep), 3420, "offsets must normalize to absolute time")
-        // Fractional seconds parse via the lenient fallback.
-        XCTAssertEqual(cutoffs["fractional"]!.timeIntervalSince(sleep), 0.5, accuracy: 0.001)
-        // A future-dated server timestamp is clamped to `now` so the
-        // bounded query can never skip real history.
-        XCTAssertEqual(cutoffs["futureDated"], now.addingTimeInterval(-72 * 3600))
+    func testTailnetEndpointValidationPreservesPath() {
+        XCTAssertEqual(AppSettings.baseURL(from: "https://phone.tail123.ts.net/import")?.path, "/import")
+        XCTAssertNotNil(AppSettings.baseURL(from: "http://100.64.0.1:8080/import"))
+        for invalid in ["https://example.com", "http://100.63.0.1", "http://100.128.0.1", "https://a.ts.net.evil.com", "https://user:secret@a.ts.net", "file:///tmp/export"] {
+            XCTAssertNil(AppSettings.baseURL(from: invalid), invalid)
+        }
     }
 
-    func testBaseURLParsing() {
-        XCTAssertEqual(
-            AppSettings.baseURL(from: "100.64.0.7:8787")?.absoluteString,
-            "http://100.64.0.7:8787"
-        )
-        XCTAssertEqual(
-            AppSettings.baseURL(from: " http://100.64.0.7:8787/ ")?.absoluteString,
-            "http://100.64.0.7:8787"
-        )
-        XCTAssertEqual(
-            AppSettings.baseURL(from: "https://pulso.example.ts.net")?.absoluteString,
-            "https://pulso.example.ts.net"
-        )
-        XCTAssertNil(AppSettings.baseURL(from: ""))
-        XCTAssertNil(AppSettings.baseURL(from: "   "))
-        XCTAssertNil(AppSettings.baseURL(from: "http://"))
+    func testWorkoutAndECGUseSeparateCollections() throws {
+        var workout = sleepDTO
+        workout.type = "workout"
+        workout.duration = 60
+        workout.workoutActivityType = "running"
+        var ecg = sleepDTO
+        ecg.type = "electrocardiogram"
+        ecg.details = ["voltageMeasurements": .array([.object(["voltage": .number(123)])])]
+        let root = try JSONDecoder().decode([String: JSONValue].self, from: HealthAutoExport.encode([.sample(workout), .sample(ecg)]))
+        guard case .object(let data) = root["data"], case .array(let workouts) = data["workouts"], case .array(let recordings) = data["ecg"] else { return XCTFail("missing collections") }
+        XCTAssertEqual(workouts.count, 1)
+        XCTAssertEqual(recordings.count, 1)
     }
+
+    func testHealthKeyAndIdempotencyStayStableAcrossRetries() throws {
+        let url = URL(string: "https://receiver.tail123.ts.net/import")!
+        let body = Data("synthetic health payload".utf8)
+        let first = try HTTPUploader.request(body: body, gzipped: false, url: url, token: "test-key")
+        let retry = try HTTPUploader.request(body: body, gzipped: false, url: url, token: "test-key")
+        XCTAssertEqual(first.httpMethod, "POST")
+        XCTAssertEqual(first.value(forHTTPHeaderField: "X-Health-Key"), "test-key")
+        XCTAssertNil(first.value(forHTTPHeaderField: "Authorization"))
+        XCTAssertEqual(first.value(forHTTPHeaderField: "Idempotency-Key"), retry.value(forHTTPHeaderField: "Idempotency-Key"))
+        XCTAssertThrowsError(try HTTPUploader.request(body: body, gzipped: false, url: URL(string: "https://example.com")!, token: "test-key"))
+        XCTAssertThrowsError(try HTTPUploader.request(body: body, gzipped: false, url: url, token: nil))
+    }
+
 }

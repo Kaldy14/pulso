@@ -8,6 +8,17 @@ struct StatusView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("Synchronizace") {
+                    if let last = status.typeStatus.values.compactMap(\.lastDelivered).max() {
+                        LabeledContent("Poslední odeslání") { Text(last, format: .dateTime) }
+                    } else {
+                        Text("Data zatím nebyla odeslána")
+                    }
+                    if let error = status.lastError { Text(error).foregroundStyle(.red) }
+                    if let response = status.lastResponse { Text(response).font(.caption) }
+                    Text("Po odemčení synchronizujeme, jakmile iOS dovolí aplikaci běžet.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if status.authNeeded {
                     Section {
                         Button {
@@ -34,7 +45,7 @@ struct StatusView: View {
                     } label: {
                         HStack {
                             if status.syncing {
-                                ProgressView()
+                                Image(systemName: "arrow.triangle.2.circlepath")
                                     .padding(.trailing, 4)
                             } else {
                                 Image(systemName: "arrow.triangle.2.circlepath")

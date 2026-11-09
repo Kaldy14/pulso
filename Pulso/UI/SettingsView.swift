@@ -12,11 +12,11 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("http://100.x.y.z:8787", text: $settings.endpoint)
+                    TextField("https://device.tailnet.ts.net/health/import", text: $settings.endpoint)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    SecureField("Bearer token (optional)", text: $settings.token)
+                    SecureField("X-Health-Key (required)", text: $settings.token)
                     Button {
                         testing = true
                         testResult = nil
@@ -27,7 +27,7 @@ struct SettingsView: View {
                     } label: {
                         HStack {
                             Text("Test Connection")
-                            if testing { Spacer(); ProgressView() }
+                            if testing { Spacer(); Image(systemName: "network") }
                         }
                     }
                     .disabled(testing)
@@ -39,7 +39,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Server")
                 } footer: {
-                    Text("Base URL of your Pulso server — every sample goes there and nowhere else. Plain HTTP is fine on a Tailscale network; the tunnel is already encrypted.")
+                    Text("Exact tailnet POST URL, including its path. Only Tailscale IPs or .ts.net names are accepted. Redirects are blocked.")
                 }
 
                 ForEach(TypeRegistry.groups, id: \.self) { group in

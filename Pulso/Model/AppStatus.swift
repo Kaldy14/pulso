@@ -19,6 +19,7 @@ final class AppStatus {
     var typeStatus: [String: TypeStatus] = [:]
     var outboxPending = 0
     var outboxNextRetry: Date?
+    var lastError: String?
     var lastResponse: String?
     var recentLog: [LogEntry] = []
 
@@ -57,6 +58,8 @@ final class AppStatus {
         lastResponse = response
         save()
     }
+
+    func setError(_ error: String?) { lastError = error }
 
     func setLastResponse(_ response: String) {
         lastResponse = response

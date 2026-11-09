@@ -19,6 +19,10 @@ struct PulsoApp: App {
 final class AppDelegate: NSObject, UIApplicationDelegate {
     let services = AppServices()
 
+    func applicationProtectedDataDidBecomeAvailable(_ application: UIApplication) {
+        Task { await services.syncNow(.foreground) }
+    }
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil

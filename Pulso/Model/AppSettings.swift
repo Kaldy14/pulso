@@ -6,10 +6,7 @@ enum SettingsKeys {
     static let enabledTypes = "types.enabled"
     static let tokenAccount = "server-token"
     static let outboxSequence = "outbox.seq"
-    /// True from the moment a full re-import is requested until a sync pass
-    /// covers every enabled type without error. While set, the /latest
-    /// catch-up shortcut is disabled so the re-import cannot be defeated by
-    /// an interleaved or resumed pass.
+    /// Durable indication that a requested full history import is unfinished.
     static let reimportPending = "sync.reimportPending"
 }
 
@@ -41,7 +38,7 @@ final class AppSettings {
     func setEnabled(_ key: String, _ value: Bool) { enabled[key] = value }
 
     var baseURL: URL? { Self.baseURL(from: endpoint) }
-    var healthURL: URL? { baseURL.flatMap { URL(string: $0.absoluteString + "/health") } }
+    var healthURL: URL? { baseURL }
 
     // MARK: - Shared parsing / thread-safe accessors
 
@@ -50,15 +47,20 @@ final class AppSettings {
         guard !s.isEmpty else { return nil }
         if !s.contains("://") { s = "http://" + s }
         while s.hasSuffix("/") { s.removeLast() }
-        guard let url = URL(string: s), url.host() != nil else { return nil }
+        guard let url = URL(string: s), let host = url.host()?.lowercased(),
+              ["http", "https"].contains(url.scheme ?? ""), url.user == nil, url.password == nil,
+              url.fragment == nil, url.query == nil else { return nil }
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        let ipv4 = octets.count == 4 && octets[0] == 100 && (64...127).contains(octets[1]) && octets.allSatisfy { (0...255).contains($0) }
+        let ipv6 = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).hasPrefix("fd7a:115c:a1e0:")
+        guard ipv4 || ipv6 || host.hasSuffix(".ts.net") else { return nil }
         return url
     }
 
     /// Where to POST, resolved at send time. nil = not configured yet.
     nonisolated static func currentTarget() -> (url: URL, token: String?)? {
-        guard let base = currentBase(),
-              let url = URL(string: base.url.absoluteString + "/ingest") else { return nil }
-        return (url, base.token)
+        guard let base = currentBase(), let token = base.token, !token.isEmpty else { return nil }
+        return (base.url, token)
     }
 
     nonisolated static func currentBase() -> (url: URL, token: String?)? {

@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-/// Single-purpose keychain wrapper for the optional server bearer token.
+/// Single-purpose keychain wrapper for the required X-Health-Key.
 enum Keychain {
     private static let service = Bundle.main.bundleIdentifier ?? "dev.lenilson.pulso"
 

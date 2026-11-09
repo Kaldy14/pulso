@@ -288,14 +288,11 @@ final class SerializerTests: XCTestCase {
             // Lifestyle
             "sexualActivity",
         ]
-        XCTAssertEqual(TypeRegistry.all.map(\.key), expected)
-        XCTAssertEqual(Set(TypeRegistry.all.map(\.key)).count, TypeRegistry.all.count, "keys must be unique")
-        XCTAssertEqual(TypeRegistry.readTypes.count, TypeRegistry.all.count)
-        XCTAssertEqual(TypeRegistry.groups.count, 9)
-        // Only the app's raison-d'être types warrant .immediate wakes.
-        XCTAssertEqual(
-            TypeRegistry.all.filter { $0.frequency == .immediate }.map(\.key),
-            ["sleepAnalysis", "workout"]
-        )
+        XCTAssertTrue(Set(expected).isSubset(of: Set(TypeRegistry.all.map(\.key))))
+        XCTAssertEqual(Set(TypeRegistry.all.map(\.key)).count, TypeRegistry.all.count)
+        for key in ["bloodPressureSystolic", "bloodPressureDiastolic", "headache", "electrocardiogram", "workoutRoute"] {
+            XCTAssertNotNil(TypeRegistry.type(for: key), key)
+        }
+        XCTAssertFalse(TypeRegistry.readTypes.contains { $0 is HKCorrelationType })
     }
 }

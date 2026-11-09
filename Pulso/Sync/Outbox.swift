@@ -95,22 +95,21 @@ actor Outbox {
             do {
                 batch = try Wire.fileDecoder().decode(Batch.self, from: Data(contentsOf: file))
             } catch {
-                // A batch file we can't read would poison the queue forever; set it aside.
-                quarantine(file)
-                await log.error("outbox: unreadable batch \(file.lastPathComponent) set aside (\(error.localizedDescription))")
-                continue
+                // Skipping this page could acknowledge a later anchor and lose data.
+                await recordFailure("Unreadable pending batch; delivery stopped: \(file.lastPathComponent)", status: nil)
+                return
             }
             do {
-                let body = try Wire.encodeElements(batch.elements)
-                let result = try await uploader.send(Gzip.compress(body), gzipped: true, to: target.url, token: target.token)
+                let body = try HealthAutoExport.encode(batch.elements)
+                let result = try await uploader.send(body, gzipped: false, to: target.url, token: target.token)
                 guard result.isSuccess else {
                     await recordFailure("HTTP \(result.status) \(result.bodySnippet.prefix(120))", status: result.status)
                     return
                 }
-                try? FileManager.default.removeItem(at: file)
                 if let anchorData = batch.anchor {
                     anchors.saveRaw(anchorData, for: batch.typeKey)
                 }
+                try FileManager.default.removeItem(at: file)
                 failureCount = 0
                 nextAttempt = .distantPast
                 let response = "HTTP \(result.status) · \(result.bodySnippet.prefix(80))"
@@ -126,6 +125,7 @@ actor Outbox {
     }
 
     private func recordFailure(_ reason: String, status statusCode: Int?) async {
+        await status.setError(reason)
         failureCount += 1
         let delay = min(
             Self.maxRetryInterval,
@@ -133,14 +133,9 @@ actor Outbox {
         )
         nextAttempt = Date(timeIntervalSinceNow: delay)
         var hint = ""
-        if statusCode == 401 { hint = " — check the bearer token in Settings" }
+        if statusCode == 401 { hint = " — check the X-Health-Key in Settings" }
         await status.setLastResponse(String(reason.prefix(160)))
         await log.warn("delivery failed: \(reason)\(hint) — retrying in \(Int(delay))s")
-    }
-
-    private func quarantine(_ file: URL) {
-        let destination = file.appendingPathExtension("corrupt")
-        try? FileManager.default.moveItem(at: file, to: destination)
     }
 
     // MARK: - State
@@ -152,6 +147,16 @@ actor Outbox {
         return contents
             .filter { $0.pathExtension == "json" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    /// Resume from the newest durably queued page after process death.
+    func queuedAnchor(for key: String) throws -> Data? {
+        var result: Data?
+        for file in pendingFiles() {
+            let batch = try Wire.fileDecoder().decode(Batch.self, from: Data(contentsOf: file))
+            if batch.typeKey == key, let anchor = batch.anchor { result = anchor }
+        }
+        return result
     }
 
     func pendingCount() -> Int {

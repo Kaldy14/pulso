@@ -11,12 +11,10 @@ struct SampleDTO: Codable, Equatable, Sendable {
     var unit: String? = nil
     var source: String
     var sourceBundleId: String? = nil
-    /// For workouts: the sample's full HealthKit metadata dictionary. For
-    /// every other type the only key is "timeZone". In both cases "timeZone"
-    /// appears only when the sample itself recorded one (HKMetadataKeyTimeZone);
-    /// absent means the timestamps' offset is the device timezone at sync
-    /// time — an assumption, not a recorded fact.
+    /// Source metadata. DetailedSerializer preserves fields for all exported samples.
     var metadata: [String: JSONValue]? = nil
+
+    var details: [String: JSONValue]? = nil
 
     // Workouts only.
     var workoutActivityType: String? = nil
@@ -36,10 +34,16 @@ enum JSONValue: Codable, Equatable, Sendable {
     case string(String)
     case number(Double)
     case bool(Bool)
+    case array([JSONValue])
+    case object([String: JSONValue])
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
-        if let s = try? container.decode(String.self) {
+        if let a = try? container.decode([JSONValue].self) {
+            self = .array(a)
+        } else if let o = try? container.decode([String: JSONValue].self) {
+            self = .object(o)
+        } else if let s = try? container.decode(String.self) {
             self = .string(s)
         } else if let b = try? container.decode(Bool.self) {
             self = .bool(b)
@@ -59,6 +63,8 @@ enum JSONValue: Codable, Equatable, Sendable {
         case .string(let s): try container.encode(s)
         case .number(let n): try container.encode(n)
         case .bool(let b): try container.encode(b)
+        case .array(let a): try container.encode(a)
+        case .object(let o): try container.encode(o)
         }
     }
 }

@@ -1,166 +1,46 @@
-<p align="center">
-  <img src="docs/icon.png" width="128" alt="Pulso app icon — an ECG snap electrode">
-</p>
+# Pulso · Kaldy14 tailnet fork
 
-<h1 align="center">Pulso</h1>
+A native SwiftUI app that reads Apple Health with permission and exports to **one configured tailnet URL**. No analytics, advertising SDKs, cloud accounts or third-party transport dependencies.
 
-<p align="center"><strong>Continuously deliver your Apple Health data to a server you own.</strong></p>
+## Install
 
-Pulso is an open-source iOS app with one job: read the Apple Health data you
-select and ship it — incrementally, in the background, surviving crashes and
-outages — to an HTTP endpoint you configure. Self-hosted personal telemetry.
+Open `Pulso.xcodeproj` in Xcode 26+ (built here with Xcode 27.2). Select the development team belonging to `it@vosime.cz`, enable automatic signing and run on a trusted iPhone with Developer Mode enabled. Bundle identifier: `cz.vosime.pulso.kaldy14`. No signing identity or health key is committed.
 
-<p align="center">
-  <img src="docs/screenshots/status.png" width="300" alt="Status screen: per-type sync state and Sync Now">
-  &nbsp;&nbsp;
-  <img src="docs/screenshots/settings.png" width="300" alt="Settings screen: server endpoint, bearer token, per-type toggles">
-</p>
+Settings accepts the **complete POST URL**, including path, and a required `X-Health-Key` stored in the device-only Keychain. Use a Tailscale IPv4 address (`100.64.0.0/10`), Tailscale IPv6 address, or a `.ts.net` hostname. Tailscale must be connected on the phone. HTTPS is recommended; HTTP is supported inside the encrypted tailnet. Redirects are always refused. Test Connection issues HEAD to that exact URL; a receiver that only implements POST may return 405.
 
-## Privacy model (read this first)
+Grant Health Access, then Sync Now. The first import includes the complete accessible history. Keep the phone unlocked and app open for that import. The Status tab shows last successful delivery, pending batches and errors.
 
-- All data flows **device → your server**. There is no cloud, no account, no
-  analytics, no telemetry, and no third-party code (zero dependencies).
-- The app makes exactly **three kinds of network calls**, all to the server
-  you configure: `POST /ingest` (your health samples), `GET /health` (the
-  "Test Connection" button), and `GET /latest` (asks your server what it
-  already holds, so a reinstall doesn't re-send all history). Nothing else,
-  ever.
-- Pending data on the device is excluded from device backups.
-- The optional bearer token is stored in the iOS Keychain.
+## Coverage and platform limits
 
-## Why it exists
-
-Apple Health has no API. The data lives in an encrypted on-device store that
-only a native iOS app can read, with per-type user consent. One-shot exports
-are manual, huge, and instantly stale; Shortcuts can't read workouts at all
-and takes tens of minutes for a few thousand samples. If you want your sleep
-and workouts available to your own tools (say, AI agents on your Mac)
-continuously, a dedicated app is the only honest path. This is that app.
-
-## How it works
-
-```
-HealthKit ──anchored queries──► SyncEngine ──batches──► Outbox (disk) ──HTTP──► your server
-                 ▲                                          │
-   observer / BGTask / foreground triggers            retry w/ backoff
-```
-
-- **Anchored queries** (`HKAnchoredObjectQuery`) are the sync cursor: each
-  pass returns exactly the new samples and deletions since the last anchor —
-  rewrites and late backfills from other apps included.
-- **The outbox** writes every batch to disk *before* the first upload
-  attempt and deletes it only on a server 2xx. **The anchor advances only
-  when the server ACKs.** Crash anywhere and the worst case is a re-send,
-  which the server dedupes by sample uuid.
-- **Triggers**: HealthKit background delivery (immediate for sleep and
-  workouts, hourly for the rest), an opportunistic `BGAppRefreshTask`, and a
-  full sync every time you open the app.
-
-**Honest expectations:** iOS does not run daemons, and health data is
-unreadable while the phone is locked. In practice, sleep data lands on your
-server within minutes of picking up the phone in the morning. That is the
-ceiling on iOS, and it's good enough.
-
-### Synced types
-
-58 types across nine groups: sleep & circadian (sleep stages, daylight
-time, wrist temperature, breathing disturbances, stand hours, mindfulness),
-workouts (with full metadata and heart-rate statistics), energy & activity,
-cardio & recovery, body composition, running & gait form, audio exposure,
-nutrition, and lifestyle (sexual activity). The complete list with units lives in
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md). The architecture is type-generic —
-adding a type is a row in
-[`TypeRegistry.swift`](Pulso/Health/TypeRegistry.swift). Every type can be
-toggled individually in Settings.
-
-## Quick start
-
-### 1. Run a server
-
-Anything that speaks [the protocol](docs/PROTOCOL.md) works. The reference
-server is a single Rust binary that appends NDJSON to disk:
+The checked-in catalogue is generated from Apple's public SDK, rather than the original hand-maintained 58-type list:
 
 ```sh
-cargo build --release                             # binary: target/release/pulso-server
-PULSO_TOKEN=secret PULSO_BIND=0.0.0.0 target/release/pulso-server   # port 8787, ./data
+python3 scripts/generate-health-types.py
 ```
 
-or with Docker:
+It contains all 192 public quantity/category identifiers present in the SDK used here, with runtime OS-version gates. New SDK types require regeneration and an app update: HealthKit has no public API that enumerates future types or reveals which read permissions were granted. Unsupported, denied and empty data cannot always be distinguished.
+
+Specialized readers add workouts, workout routes, ECG voltage series, blood-pressure correlations, State of Mind (iOS 18+) and medication dose events with medication names/codings (iOS 26+). Workout exports include recorded lap/segment events, elevation metadata, heart-rate samples and recorded heart-rate recovery. Missing measurements are not invented. Routes also have an independent anchored stream so routes arriving after their workout are not lost. Independent heart-rate and recovery streams preserve late arrivals too.
+
+This is **not every HealthKit object class**: clinical/FHIR records, characteristics (birth date etc.), activity summaries, audiograms, heartbeat series, vision prescriptions and scored questionnaires still need dedicated readers. Clinical records also need additional entitlements. Quantity/category coverage does not imply support for those distinct APIs.
+
+## Delivery contract
+
+See [docs/TAILNET-EXPORT.md](docs/TAILNET-EXPORT.md). The JSON uses Health Auto Export's `data.metrics` and `data.workouts` envelope and separate `ecg`, `symptoms`, `stateOfMind`, `medications` arrays, extended with stable sample `id`, raw categories, `routes` and deletion UUIDs. Generic types without a dedicated HAE mapping use their snake_case HealthKit name. This is a raw-sample export, not daily aggregated HAE data; validate the mapping against your receiver before importing real history.
+
+**The upstream Rust receiver in `server/` implements the old Pulso protocol and is not compatible with this fork's new export.** It is retained as upstream reference; do not use its original deployment instructions with this app. No receiver is deployed by this change.
+
+HealthKit observers, background delivery, opportunistic background refresh, foreground entry and the protected-data-available callback trigger incremental anchored queries. iOS controls when background execution is granted. Neither instant delivery on unlock nor execution after force-quitting the app can be guaranteed.
+
+Delivery is at-least-once. Retry requests carry a stable SHA-256 `Idempotency-Key`; records carry HealthKit UUIDs. The receiver must atomically deduplicate/upsert by record identity and acknowledge only after durable storage. A network retry after a lost response is unavoidable. Local anchors and queued pages survive process restarts; corrupted pending files stop delivery rather than silently skipping health data.
+
+## Verification
 
 ```sh
-docker build -t pulso-server server/
-docker run -p 8787:8787 -v pulso-data:/data pulso-server
+xcodebuild -project Pulso.xcodeproj -scheme Pulso -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project Pulso.xcodeproj -scheme Pulso -destination 'platform=iOS Simulator,name=<your simulator>' CODE_SIGNING_ALLOWED=NO test
 ```
 
-Your data ends up in `data/<type>.ndjson` — one JSON object per line,
-inspectable with `cat`.
+A simulator test or unsigned build does not verify real HealthKit permissions, locked-device wake timing, tailnet delivery or installation with a developer account. Those require a signed build and the target iPhone.
 
-### 2. Build the app
-
-Open `Pulso.xcodeproj` in Xcode 15+, select the **Pulso** target → Signing &
-Capabilities, pick your team, and run on your iPhone (iOS 17+).
-
-- **Free Apple ID:** works, but apps expire after 7 days and must be
-  re-installed from Xcode.
-- **Paid developer account:** 1-year signing, plus TestFlight if you want
-  install-over-the-air.
-- App Store distribution is possible but brings review requirements
-  (privacy policy URL, etc.) — out of scope here.
-
-### 3. Configure and sync
-
-In the app: Settings → enter your server URL (e.g. `http://100.64.0.7:8787`),
-optionally a token → Test Connection → Status → Grant Health Access → Sync Now.
-
-The first sync imports your full history (can be 100k+ samples — keep the
-app open and unlocked; a progress note shows in Status). It ships in 5,000-
-sample chunks and saves progress continuously, so interrupting it is safe.
-After that, everything is incremental and automatic.
-
-## Tailscale and plain HTTP
-
-Pulso is built with a tailnet in mind: the endpoint is typically a
-`100.x.y.z` address reachable only inside your WireGuard-encrypted network.
-Because raw IPs can't get TLS certificates, the app sets ATS
-`NSAllowsArbitraryLoads` to permit plain HTTP — the tailnet already encrypts
-the wire. If you point Pulso at a server across the open internet instead,
-use HTTPS.
-
-## FAQ
-
-**A type shows "No data yet" — is permission missing or is there no data?**
-iOS won't tell (by design: read-permission status is invisible to apps).
-Check the Health app → Profile → Apps → Pulso. This is why the UI treats
-both states as one.
-
-**I see overlapping sleep records from Watch, WHOOP, and AutoSleep.**
-By design. Pulso delivers every source faithfully with `source` attribution
-and never merges — dedupe/merge policy belongs to your analysis, not your
-transport.
-
-**What about deleted samples?**
-Anchored queries surface deletions; Pulso ships them as tombstones
-(`{"deleted": [uuids]}`) and the reference server records them in
-`_deleted.ndjson`.
-
-**I restored my phone from a backup / added a second device — is my data complete?**
-Run Settings → Re-import Full History once. Fresh installs normally skip
-history the server already has (via `GET /latest`), but that check has no
-per-device awareness — samples that only exist on the "new" device and
-predate the server's newest data would otherwise be skipped.
-
-**Workout GPS routes? ECG? Writing data back?**
-Out of scope for v1. Routes (`HKWorkoutRoute`) are the most likely v2 item.
-
-## Repository layout
-
-```
-Pulso/            the iOS app (SwiftUI, zero dependencies)
-PulsoTests/       unit tests (serializers, outbox state machine, gzip, wire format)
-server/           reference receiver (Rust) + Dockerfile
-docs/PROTOCOL.md  the versioned app↔server contract
-```
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).

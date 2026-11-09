@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import UIKit
 
 enum SyncReason: CustomStringConvertible, Sendable {
     case manual
@@ -21,139 +22,93 @@ enum SyncReason: CustomStringConvertible, Sendable {
     }
 }
 
-enum CatchUp {
-    /// Safety margin subtracted from the server's newest timestamp: sources
-    /// like WHOOP backfill days late, and re-sent overlap is free (the
-    /// server dedupes by uuid).
-    static let margin: TimeInterval = 72 * 3600
-
-    /// Timestamps are clamped to `now` before the margin is applied: a
-    /// future-dated server timestamp would otherwise produce an empty
-    /// bounded query that persists a store-wide anchor and permanently
-    /// skips the type's history.
-    static func cutoffs(fromLatest latest: [String: String], now: Date = Date()) -> [String: Date] {
-        let strict = ISO8601DateFormatter()
-        strict.formatOptions = [.withInternetDateTime]
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return latest.compactMapValues { raw in
-            guard let parsed = strict.date(from: raw) ?? fractional.date(from: raw) else { return nil }
-            return min(parsed, now).addingTimeInterval(-margin)
-        }
-    }
-}
-
 /// Per enabled type: run an anchored query from the last anchor, hand the
 /// results to the outbox, and let the outbox persist the new anchor once the
 /// server ACKs. An in-memory anchor cache leads the persisted one so
 /// overlapping triggers don't re-read samples that are already queued; after
-/// a crash the cache is gone, the persisted anchor wins, and any re-read
-/// samples dedupe server-side by uuid.
+/// a crash the newest queued checkpoint wins over the acknowledged anchor.
+/// The receiver still deduplicates UUIDs if enqueue or HTTP acknowledgment was interrupted.
 actor SyncEngine {
-    static let queryLimit = 5000
+    static let queryLimit = 100
 
     private let healthStore: HKHealthStore
     private let anchors: AnchorStore
     private let outbox: Outbox
     private let log: LogStore
     private let status: AppStatus
-    /// GET /latest from the configured server; nil when unavailable.
-    private let latestHints: @Sendable () async -> [String: String]?
     private var anchorCache: [String: HKQueryAnchor] = [:]
     private var chain: Task<Void, Never>?
-    /// Types whose query threw last time (typically authorization not yet
-    /// granted for a newly added type). They must not hold the catch-up
-    /// gate open on every background wake; cleared on user-visible passes
-    /// so a grant is picked up promptly.
-    private var authBlocked: Set<String> = []
-    /// GET /latest result (including failure) cached briefly so background
-    /// wakes don't pay a network round-trip per pass.
-    private var latestFetch: (at: Date, hints: [String: String]?)?
-    private static let latestCacheInterval: TimeInterval = 15 * 60
+    private var anotherPass = false
 
     init(
         healthStore: HKHealthStore, anchors: AnchorStore, outbox: Outbox,
-        log: LogStore, status: AppStatus,
-        latestHints: @escaping @Sendable () async -> [String: String]? = { nil }
+        log: LogStore, status: AppStatus
     ) {
         self.healthStore = healthStore
         self.anchors = anchors
         self.outbox = outbox
         self.log = log
         self.status = status
-        self.latestHints = latestHints
     }
 
     /// Every trigger funnels here. Passes are serialized; each caller returns
     /// after its own pass (and the outbox drain it triggers) completes.
     func requestSync(_ reason: SyncReason) async {
-        let previous = chain
+        if let chain {
+            anotherPass = true
+            await chain.value
+            return
+        }
         let task = Task {
-            await previous?.value
-            await self.performSync(reason)
+            repeat {
+                self.anotherPass = false
+                await self.performSync(reason)
+            } while self.anotherPass && !Task.isCancelled
         }
         chain = task
-        await task.value
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        chain = nil
     }
 
     private func performSync(_ reason: SyncReason) async {
+        guard !Task.isCancelled, await MainActor.run(body: { UIApplication.shared.isProtectedDataAvailable }) else { return }
         guard AppSettings.currentTarget() != nil else {
             await log.info("sync skipped (\(reason)): no server configured")
             return
         }
         await status.setSyncing(true)
+        await status.setError(nil)
         let enabled = AppSettings.currentEnabledTypes()
 
-        // A user-visible pass may follow a permission grant — retry types
-        // that were failing. Background wakes keep them excluded.
-        switch reason {
-        case .manual, .foreground, .settingsChanged, .reimport:
-            authBlocked.removeAll()
-        case .observer, .backgroundRefresh:
-            break
-        }
-
-        // Resolve every anchor exactly once; the catch-up gate and the
-        // cutoff application below both derive from this resolution. (An
-        // anchor file that exists but fails to decode counts as missing —
-        // it must trigger catch-up, not an unbounded full read.)
+        // Resume from queued checkpoints before acknowledged disk anchors.
         var resolvedAnchors: [String: HKQueryAnchor] = [:]
         for type in enabled {
-            if let anchor = anchorCache[type.key] ?? anchors.load(type.key) {
+            let queuedData: Data?
+            do { queuedData = try await outbox.queuedAnchor(for: type.key) }
+            catch {
+                await status.setError("Unreadable pending batch. Sync stopped to preserve data.")
+                await status.setSyncing(false)
+                return
+            }
+            let queuedAnchor = queuedData.flatMap { try? NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: $0) }
+            if let anchor = anchorCache[type.key] ?? queuedAnchor ?? anchors.load(type.key) {
                 resolvedAnchors[type.key] = anchor
             }
         }
-        let missing = enabled.map(\.key).filter { resolvedAnchors[$0] == nil && !authBlocked.contains($0) }
-
-        // Catch-up: for types with no anchor (fresh install, newly enabled),
-        // ask the server what it already has and skip re-reading history.
-        // A full re-import must bypass this, or it couldn't re-send — and
-        // the bypass must be durable state, not just this pass's reason:
-        // an interleaved or resumed pass would otherwise catch-up against
-        // the fully-populated server and defeat the re-import.
-        var cutoffs: [String: Date] = [:]
         let reimporting = UserDefaults.standard.bool(forKey: SettingsKeys.reimportPending)
-        if !reimporting && !missing.isEmpty {
-            if let latest = await cachedLatestHints() {
-                let parsed = CatchUp.cutoffs(fromLatest: latest)
-                if parsed.count < latest.count {
-                    await log.warn("server /latest: \(latest.count - parsed.count) unparseable timestamp(s) ignored")
-                }
-                cutoffs = parsed.filter { missing.contains($0.key) }
-                if !cutoffs.isEmpty {
-                    await log.info("server /latest: catching up instead of full backfill for \(cutoffs.count) type(s)")
-                }
-            }
-        }
 
         var queued = 0
         var anyFailed = false
         for type in enabled {
             do {
-                queued += try await sync(type, anchor: resolvedAnchors[type.key], cutoffs: cutoffs)
+                queued += try await sync(type, anchor: resolvedAnchors[type.key])
             } catch {
                 anyFailed = true
-                authBlocked.insert(type.key)
+                await status.setError("\(type.displayName): \(error.localizedDescription)")
                 await log.error("\(type.key): \(error.localizedDescription)")
             }
         }
@@ -173,31 +128,16 @@ actor SyncEngine {
         }
     }
 
-    private func cachedLatestHints() async -> [String: String]? {
-        if let cached = latestFetch, Date().timeIntervalSince(cached.at) < Self.latestCacheInterval {
-            return cached.hints
-        }
-        let hints = await latestHints()
-        latestFetch = (Date(), hints)
-        return hints
-    }
-
-    private func sync(_ type: SyncedType, anchor resolvedAnchor: HKQueryAnchor?, cutoffs: [String: Date]) async throws -> Int {
+    private func sync(_ type: SyncedType, anchor resolvedAnchor: HKQueryAnchor?) async throws -> Int {
         var anchor = resolvedAnchor
-        // Date-bounding a nil-anchor query skips the historical read while
-        // still returning a store-wide anchor, so later incremental syncs
-        // (which drop the predicate) see every subsequent change.
-        var datePredicate: NSPredicate?
-        if anchor == nil, let cutoff = cutoffs[type.key] {
-            datePredicate = HKQuery.predicateForSamples(withStart: cutoff, end: nil)
-            await log.info("\(type.key): server has history — backfilling only from \(cutoff.formatted(.iso8601))")
-        }
         var queued = 0
+        let pageLimit = ["workout", "workoutRoute", "electrocardiogram"].contains(type.key) ? 1 : Self.queryLimit
         while true {
+            try Task.checkCancellation()
             let descriptor = HKAnchoredObjectQueryDescriptor(
-                predicates: [.sample(type: type.sampleType, predicate: datePredicate)],
+                predicates: [.sample(type: type.sampleType, predicate: nil)],
                 anchor: anchor,
-                limit: Self.queryLimit
+                limit: pageLimit
             )
             let result = try await descriptor.result(for: healthStore)
             let added = result.addedSamples
@@ -209,15 +149,18 @@ actor SyncEngine {
                 // persisting it immediately is safe.
                 if let newAnchor {
                     anchorCache[type.key] = newAnchor
-                    anchors.save(newAnchor, for: type.key)
+                    // Only persist an empty result if no earlier page remains unacknowledged.
+                    if await outbox.pendingCount() == 0 { anchors.save(newAnchor, for: type.key) }
                 }
                 await status.recordChecked(type.key)
                 return queued
             }
 
-            let dtos = added.compactMap { type.serialize($0, .live) }
-            if dtos.count < added.count {
-                await log.warn("\(type.key): \(added.count - dtos.count) sample(s) not serializable — skipped")
+            var dtos: [SampleDTO] = []
+            let serializer = DetailedSerializer(store: healthStore)
+            for sample in added {
+                try Task.checkCancellation()
+                dtos.append(try await serializer.serialize(sample, as: type))
             }
             var elements = dtos.map(BatchElement.sample)
             if !deleted.isEmpty {
@@ -236,7 +179,7 @@ actor SyncEngine {
             } else {
                 await log.info("\(type.key): queued \(dtos.count) sample(s)")
             }
-            if added.count < Self.queryLimit && deleted.count < Self.queryLimit {
+            if added.count < pageLimit && deleted.count < pageLimit {
                 return queued
             }
         }
@@ -250,7 +193,5 @@ actor SyncEngine {
 
     func resetAllAnchors() {
         anchorCache = [:]
-        authBlocked = []
-        latestFetch = nil
     }
 }

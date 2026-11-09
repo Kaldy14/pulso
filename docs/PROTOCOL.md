@@ -1,3 +1,5 @@
+> Legacy upstream protocol. This fork sends [Tailnet Health Auto Export](TAILNET-EXPORT.md) instead.
+
 # Pulso Ingest Protocol — v1
 
 The contract between the Pulso iOS app and any receiving server. It is
