@@ -36,7 +36,8 @@ enum SyncReason: CustomStringConvertible, Sendable {
 /// a crash the newest queued checkpoint wins over the acknowledged anchor.
 /// The receiver still deduplicates UUIDs if enqueue or HTTP acknowledgment was interrupted.
 actor SyncEngine {
-    static let queryLimit = 100
+    // Larger metric pages reduce requests; routes, ECG and workouts stay one per page.
+    static let queryLimit = 1000
 
     private let healthStore: HKHealthStore
     private let anchors: AnchorStore

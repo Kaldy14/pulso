@@ -105,7 +105,7 @@ actor Outbox {
     }
 
     private func performDrain(force: Bool) async {
-        var files = pendingFiles()
+        let files = pendingFiles()
         guard !files.isEmpty else { return }
         guard let target = target() else {
             await log.info("outbox: \(files.count) batch(es) waiting — no server configured")
@@ -113,8 +113,8 @@ actor Outbox {
         }
         if !force && Date() < nextAttempt { return }
 
-        while let file = files.first, !Task.isCancelled {
-            files.removeFirst()
+        for file in files {
+            if Task.isCancelled { return }
             let batch: Batch
             do {
                 batch = try Wire.fileDecoder().decode(Batch.self, from: Data(contentsOf: file))

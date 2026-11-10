@@ -71,3 +71,21 @@ Cancellation without remaining callers preserves queued pages for a fresh run.
 - Simulator before/after captures and a recording of the confirmation flow are
   supplied in the conversation. Simulator counters include synthetic unit-test
   data; these captures do not demonstrate a real health-history upload.
+
+## Export throughput (2026-11-10)
+
+- Metric query pages increased from 100 to 1,000 records. This applies to new
+  reads, not already queued files. Workouts, ECG and routes remain one per page;
+  the existing byte-size splitter remains active.
+- Export timestamp parsers/formatters are reused within each request. Mixed
+  offsets and retry determinism are covered by a regression. A release-optimized
+  standalone Swift benchmark encoding 20 batches of 100 synthetic samples took
+  1.7476 seconds before and 0.3029 seconds after; output bytes matched exactly.
+  This measures encoding, not end-to-end sync or network throughput.
+- FIFO iteration no longer repeatedly shifts the entire pending-file array.
+- 53 iOS tests passed; signed device build and codesign verification passed.
+- Lenovo forwarder now reuses its HTTPS connection and drains responses before
+  reuse. Three synthetic tests cover shared-connection FIFO, non-2xx retention
+  and connection-loss retention. Source and tests are in ops/health-relay.
+- The downstream receiver was timing out during this check. Connection reuse
+  cannot remove server outages, and total completion time is not established.

@@ -15,6 +15,23 @@ final class WireFormatTests: XCTestCase {
         )
     }
 
+    func testExportTimestampCacheKeepsMixedOffsetsAndWireBytes() throws {
+        let inputs = ["2026-11-09T12:00:00+01:00", "2026-11-09T12:00:00-05:00", "2026-11-09T12:00:00Z", "2026-11-09T12:00:00+05:30", "invalid"]
+        let samples = inputs.enumerated().map { i, date in
+            var sample = sleepDTO
+            sample.uuid = "test-\(i)"
+            sample.start = date
+            sample.end = date
+            return BatchElement.sample(sample)
+        }
+        let first = try HealthAutoExport.encode(samples)
+        XCTAssertEqual(first, try HealthAutoExport.encode(samples), "retry body must be deterministic")
+        let json = String(decoding: first, as: UTF8.self)
+        for expected in ["2026-11-09 12:00:00 +0100", "2026-11-09 12:00:00 -0500", "2026-11-09 12:00:00 +0000", "2026-11-09 12:00:00 +0530", "invalid"] {
+            XCTAssertTrue(json.contains(expected), expected)
+        }
+    }
+
     /// Golden test: this exact wire format is what docs/PROTOCOL.md promises.
     func testSampleGoldenEncoding() throws {
         let json = String(decoding: try Wire.encodeElements([.sample(sleepDTO)]), as: UTF8.self)

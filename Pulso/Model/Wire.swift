@@ -50,6 +50,8 @@ enum HealthAutoExport {
     static let symptomKinds: [String: String] = ["abdominalCramps": "Severity", "acne": "Severity", "appetiteChanges": "AppetiteChanges", "bladderIncontinence": "Severity", "bloating": "Severity", "breastPain": "Severity", "chestTightnessOrPain": "Severity", "chills": "Severity", "constipation": "Severity", "coughing": "Severity", "diarrhea": "Severity", "dizziness": "Severity", "drySkin": "Severity", "fainting": "Severity", "fatigue": "Severity", "fever": "Severity", "generalizedBodyAche": "Severity", "hairLoss": "Severity", "headache": "Severity", "heartburn": "Severity", "hotFlashes": "Severity", "lossOfSmell": "Severity", "lossOfTaste": "Severity", "lowerBackPain": "Severity", "memoryLapse": "Severity", "moodChanges": "Presence", "nausea": "Severity", "nightSweats": "Severity", "pelvicPain": "Severity", "rapidPoundingOrFlutteringHeartbeat": "Severity", "runnyNose": "Severity", "shortnessOfBreath": "Severity", "sinusCongestion": "Severity", "skippedHeartbeat": "Severity", "sleepChanges": "Presence", "soreThroat": "Severity", "vaginalDryness": "Severity", "vomiting": "Severity", "wheezing": "Severity"]
 
     static func encode(_ elements: [BatchElement]) throws -> Data {
+        // Formatters belong to this encoding call: reused without shared mutable state.
+        let dates = ExportDates()
         var metrics: [String: [String: JSONValue]] = [:]
         var collections: [String: [JSONValue]] = [:]
         for element in elements {
@@ -59,10 +61,10 @@ enum HealthAutoExport {
             case .sample(let sample):
                 var point = sample.details ?? [:]
                 point["id"] = .string(sample.uuid)
-                point["start"] = .string(timestamp(sample.start))
-                point["end"] = .string(timestamp(sample.end))
+                point["start"] = .string(dates.timestamp(sample.start))
+                point["end"] = .string(dates.timestamp(sample.end))
                 point["source"] = .string(sample.source)
-                point["date"] = .string(timestamp(sample.start))
+                point["date"] = point["start"]
                 if let metadata = sample.metadata { point["metadata"] = .object(metadata) }
                 switch sample.type {
                 case "workout":
@@ -95,8 +97,7 @@ enum HealthAutoExport {
                         continue
                     }
                     if sample.type == "sleepAnalysis", case .string(let stage) = sample.value {
-                        let parser = ISO8601DateFormatter()
-                        if let start = parser.date(from: sample.start), let end = parser.date(from: sample.end) {
+                        if let start = dates.parser.date(from: sample.start), let end = dates.parser.date(from: sample.end) {
                             point["qty"] = .number(end.timeIntervalSince(start) / 3600)
                         }
                         let names = ["asleepREM": "REM", "asleepCore": "Core", "asleepDeep": "Deep", "awake": "Awake", "inBed": "InBed", "asleepUnspecified": "Asleep"]
@@ -134,15 +135,25 @@ enum HealthAutoExport {
         .object(["qty": .number(value), "units": .string(units)])
     }
 
-    private static func timestamp(_ raw: String) -> String {
-        let parser = ISO8601DateFormatter()
+}
+
+private final class ExportDates {
+    let parser = ISO8601DateFormatter()
+    private var formatters: [String: DateFormatter] = [:]
+
+    func timestamp(_ raw: String) -> String {
         guard let date = parser.date(from: raw) else { return raw }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        // Preserve the offset embedded by the source serializer.
         let suffix = String(raw.suffix(6)).replacingOccurrences(of: ":", with: "")
-        formatter.timeZone = TimeZone(abbreviation: "GMT" + suffix) ?? TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+        let formatter: DateFormatter
+        if let cached = formatters[suffix] {
+            formatter = cached
+        } else {
+            formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(abbreviation: "GMT" + suffix) ?? TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+            formatters[suffix] = formatter
+        }
         return formatter.string(from: date)
     }
 }
